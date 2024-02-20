@@ -15,45 +15,33 @@ options(timeout = max(300, getOption("timeout")))
 
 ```{r}
 
-install.packages("devtools")
+# Install DSPWorkflow package
 
-library(devtools)
-
-install_github("NIDAP-Community/DSPWorkflow", ref = "dev")
-```
-
-## Load the test data
-
-``` {r Load Data, echo=TRUE}
-# Create a folder to hold the test data. 
-# Below we have designated the folder 'test_data'
-
-# Set paths for downloading dcc files
-downloads.path <- "test_data/Human_Kidney/downloaded/"
-tar.file.name <- "kidney_dccs.tar.gz"
-full.tar.path <- paste0(downloads.path,tar.file.name)
-
-# Check if dcc files were previously downloaded
-if (!file.exists(full.tar.path)) {
-  
-  # Download dcc files and place in data folder
-  data.url <- "http://hpc.nih.gov/~CCBR/DSPWorkflow/kidney_dccs.tar.gz"
-  download.file(data.url, full.tar.path)
-  untar(full.tar.path, exdir = downloads.path)
+install.DSP <- FALSE
+if(install.DSP == TRUE){
+  install.packages("devtools")
+  library(devtools)
+  install_github("NIDAP-Community/DSPWorkflow", ref = "main")
 }
 
-dcc.files <- dir(
-  file.path(
-    downloads.path,
-    "dccs"
-  ),
+library(DSPWorkflow)
+
+```
+
+## Load input data
+
+``` {r Load Data, echo=TRUE}
+# Load all inputs
+
+dcc.files <- list.files(file.path("dcc"),
   pattern = ".dcc$",
   full.names = TRUE,
   recursive = TRUE
 )
 
-pkc.files <- "test_data/Human_Kidney//TAP_H_WTA_v1.0.pkc"
-pheno.data.file <- "test_data/Human_Kidney/kidney_annotations.xlsx"
+pkc.files <- "Hs_R_NGS_WTA_v1.0.pkc"
+pheno.data.file <- "annotation_Krug_CPTR_5.xlsx"
+
 ```
 
 # Run the first step of the DSP Workflow package
@@ -62,18 +50,16 @@ pheno.data.file <- "test_data/Human_Kidney/kidney_annotations.xlsx"
 
 ```{r Study Design, echo=TRUE}
 
-library(DSPWorkflow)
-
 # Save the output from the study design function into a list
 sdesign.list <- studyDesign(dcc.files = dcc.files, 
                                 pkc.files = pkc.files,
                                 pheno.data.file = pheno.data.file,
-                                pheno.data.sheet = "Template",
+                                pheno.data.sheet = "annotation",
                                 pheno.data.dcc.col.name = "Sample_ID",
                                 protocol.data.col.names = c("aoi", "roi"),
                                 experiment.data.col.names = c("panel"),
                                 slide.name.col = "slide name", 
-                                class.col = "class", 
+                                class.col = "Tumor", 
                                 region.col = "region", 
                                 segment.col = "segment",
                                 area.col = "area",
@@ -88,7 +74,7 @@ print(sdesign.list$object)
 
 # Print out the Sankey Plot
 
-print(sdesign.list$object)
+print(sdesign.list$sankey.plot)
 ```
 
 ## 2. QC Preprocessing:
@@ -99,15 +85,17 @@ qc.output <-  qcProc(object = sdesign.list$object,
                         min.segment.reads = 1000, 
                         percent.trimmed = 80,    
                         percent.stitched = 80,   
-                        percent.aligned = 75,    
+                        percent.aligned = 80,    
                         percent.saturation = 50, 
-                        min.negative.count = 1,   
-                        max.ntc.count = 9000,     
-                        min.nuclei = 20,         
-                        min.area = 1000,
+                        min.negative.count = 10,   
+                        max.ntc.count = 1000,     
+                        min.nuclei = 200,         
+                        min.area = 16000,
                         print.plots = TRUE)
     print(qc.output$segments.qc)
-  }
+    print(qc.output$segment.flags)
+    print(qc.output$probe.flags)
+    
 ```
 
 ## 3. Filtering:
