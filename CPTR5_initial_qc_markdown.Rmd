@@ -19,7 +19,6 @@ options(timeout = max(300, getOption("timeout")))
 
 install.DSP <- FALSE
 if(install.DSP == TRUE){
-  install.packages("devtools")
   library(devtools)
   install_github("NIDAP-Community/DSPWorkflow", ref = "main")
 }
@@ -87,10 +86,10 @@ qc.output <-  qcProc(object = sdesign.list$object,
                         percent.stitched = 80,   
                         percent.aligned = 80,    
                         percent.saturation = 50, 
-                        min.negative.count = 10,   
+                        min.negative.count = 3,   
                         max.ntc.count = 1000,     
                         min.nuclei = 200,         
-                        min.area = 16000,
+                        min.area = 1000,
                         print.plots = TRUE)
     print(qc.output$segments.qc)
     print(qc.output$segment.flags)
@@ -166,7 +165,17 @@ qc.output <-  qcProc(object = sdesign.list$object,
  
 ```{r Clustering high CV Genes, echo=TRUE}
     
-    heatmap.output <- heatMap(object = unsupervised.output$object, 
+  anno.colors <- list(
+    region = c(immune = "red", 
+               stroma = "seagreen1", 
+               'stroma/immune' = "olivedrab", 
+               tumor = "darkblue", 
+               vessel = "purple"), 
+    class = c(Biopsy = "orange", 
+              PDX = "springgreen")
+  )  
+
+  heatmap.output <- heatMap(object = unsupervised.output$object, 
                         ngenes = 200, 
                         scale.by.row.or.col = "row", 
                         show.rownames = FALSE, 
@@ -180,104 +189,10 @@ qc.output <-  qcProc(object = sdesign.list$object,
                         annotation.col = c("class", "region"), 
                         breaks.by.values = seq(-3, 3, 0.05), 
                         heatmap.color = colorRampPalette(c("blue", "white", "red"))(120), 
-                        norm.method = "quant")
+                        norm.method = "quant", 
+                        annotation.colors = anno.colors)
 
 
     print(heatmap.output$plot)
     
-```
-
-
-## 7. Differential Expression Analysis:
-
-
-```{r Differential Expression Analysis,  echo=TRUE}
-
-    goi <- c("CD274", "CD8A", "CD68", "EPCAM",
-             "KRT18", "NPHS1", "NPHS2", "CALB1", "CLDN8")
-    
-    object <- q3.normalization.output$object
-    object <- object[goi,]
-    Gene <- Subset <- NULL
-    
-    #First analysis:
-    reslist.1 <- diffExpr(object = object, 
-                          analysis.type = "Within Groups", 
-                          region.col = "region", 
-                          regions = c("glomerulus", "tubule"), 
-                          group.col = "class", 
-                          groups = c("DKD", "normal"), 
-                          n.cores = 1)
-    grid.draw(reslist.1$sample_table)
-    grid.newpage()
-    grid.draw(reslist.1$summary_table)
-    
-    lfc_col1 <- colnames(reslist.1$result)[grepl("logFC",colnames(reslist.1$result))]
-    pval_col1 <- colnames(reslist.1$result)[grepl("_pval",colnames(reslist.1$result))]
-    
-    lfc.1 <- reslist.1$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "normal") %>% 
-              select(all_of(lfc_col1)) %>% 
-              as.numeric()
-    pval.1 <- reslist.1$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "normal") %>% 
-              select(all_of(pval_col1)) %>% 
-              as.numeric()
-    
-    cat(paste0("\n\nvalue of CALB Fold Change is:", lfc.1))
-    cat("expected value is -2.014")
-    
-    cat(paste0("\nvalue of CALB pval is:",pval.1))
-    cat("expected value is 0.0274")
-    
-    #Second analysis:
-    reslist.2 <- diffExpr(object = object, 
-                          analysis.type = "Between Groups", 
-                          region.col = "region", 
-                          regions = c("glomerulus", "tubule"), 
-                          group.col = "class", 
-                          groups = c("DKD", "normal"), 
-                          n.cores = 1)
-    grid.draw(reslist.2$sample_table)
-    grid.newpage()
-    grid.draw(reslist.2$summary_table)
-    
-    lfc_col2 <- colnames(reslist.2$result)[grepl("logFC",colnames(reslist.2$result))]
-    pval_col2 <- colnames(reslist.2$result)[grepl("_pval",colnames(reslist.2$result))]
-    
-    lfc.2 <- reslist.2$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "tubule") %>% 
-              select(all_of(lfc_col2)) %>% 
-              as.numeric()
-    pval.2 <- reslist.2$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "tubule") %>% 
-              select(all_of(pval_col2)) %>% 
-              as.numeric()
-    
-    cat(paste0("\n\nvalue of CALB Fold Change is:", lfc.2))
-    cat("expected value is -1.408")
-    
-    cat(paste0("\nvalue of CALB pval is:",pval.2))
-    cat("expected value is 0.01268")
-    
-
-```
-## 8. Volcano Plot
-
-#This part is run on NIDAP.
-
-## 9. Violin Plot
-
-```{r Violin Plot, echo=TRUE}
-    library(gridExtra)
-    
-    genes <- c("CXCL8")
-    
-    violin.plot.test <- violinPlot(object = q3.normalization.output$object, 
-                                        expr.type = "q_norm", 
-                                        genes = genes,
-                                        group = "region",
-                                        facet.by = "class")
-    grid.arrange(violin.plot.test)
-
 ```
