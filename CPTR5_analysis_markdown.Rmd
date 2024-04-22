@@ -19,9 +19,8 @@ options(timeout = max(300, getOption("timeout")))
 
 install.DSP <- FALSE
 if(install.DSP == TRUE){
-  install.packages("devtools")
   library(devtools)
-  install_github("NIDAP-Community/DSPWorkflow", ref = "main")
+  install_github("NIDAP-Community/DSPWorkflow", ref = "dev")
 }
 
 library(DSPWorkflow)
@@ -40,7 +39,7 @@ dcc.files <- list.files(file.path("dcc"),
 )
 
 pkc.files <- "Hs_R_NGS_WTA_v1.0.pkc"
-pheno.data.file <- "annotation_Krug_CPTR_5.xlsx"
+pheno.data.file <- "annotation_Krug_CPTR_5_april2024_NC_edit.xlsx"
 
 ```
 
@@ -56,16 +55,16 @@ sdesign.list <- studyDesign(dcc.files = dcc.files,
                                 pheno.data.file = pheno.data.file,
                                 pheno.data.sheet = "annotation",
                                 pheno.data.dcc.col.name = "Sample_ID",
-                                protocol.data.col.names = c("aoi", "roi"),
+                                protocol.data.col.names = c("ROI"),
                                 experiment.data.col.names = c("panel"),
                                 slide.name.col = "slide name", 
-                                class.col = "Tumor", 
-                                region.col = "region", 
+                                class.col = "class", 
+                                region.col = "Region", 
                                 segment.col = "segment",
                                 area.col = "area",
                                 nuclei.col = "nuclei", 
                                 sankey.exclude.slide = FALSE, 
-                                segment.id.length = 4)
+                                segment.id.length = 10)
 
 # The output of the study design function is a Geomxset Object and a Plot
 # Print out a summary of the object
@@ -87,45 +86,261 @@ qc.output <-  qcProc(object = sdesign.list$object,
                         percent.stitched = 80,   
                         percent.aligned = 80,    
                         percent.saturation = 50, 
-                        min.negative.count = 10,   
+                        min.negative.count = 3,   
                         max.ntc.count = 1000,     
                         min.nuclei = 200,         
-                        min.area = 16000,
+                        min.area = 1000,
                         print.plots = TRUE)
     print(qc.output$segments.qc)
     print(qc.output$segment.flags)
     print(qc.output$probe.flags)
     
-```
-
-## 3. Filtering:
-
-```{r Filtering, echo=TRUE}
+    
+  # Export the flags table
+    
+  export.flags <- FALSE
   
-    goi <- c("CXCL8")
+  if(export.flags == TRUE){
     
-    filtering.output <- filtering(object = qc.output$object,
-                            loq.cutoff = 2, 
-                            loq.min = 2, 
-                            segment.gene.rate.cutoff = 0.01,
-                            study.gene.rate.cutoff = 0.01, 
-                            sankey.exclude.slide = FALSE, 
-                            goi = goi)
+    write.csv(qc.output$segment.flags, file =  "qc/segment_qc_flags.csv")
     
-    print(filtering.output$`stacked.bar.plot`)
-    print(filtering.output$`segment.table`)
-    print(filtering.output$`sankey.plot`)
-    print(filtering.output$`genes.detected.plot`)
-    print(filtering.output$'goi.table', row.names = FALSE)
+    write.csv(qc.output$probe.flags, file =  "qc/probe_qc_flags.csv")
+    
+  }
+    
 ```
 
+## 3. Filtering
+
+### Segment Filtering by Gene Detection
+
+```{r}
+
+library(GeomxTools)
+library(dplyr)
+library(knitr)
+
+
+object <- qc.output$object
+
+# Set up lists of segment IDs
+segment.list.total <- pData(object)$segmentID
+
+# Define Modules
+modules <- gsub(".pkc", "", pkc.files)
+
+# Calculate limit of quantification (LOQ) in each segment
+# LOQ = geomean(NegProbes) * geoSD(NegProbes)^(LOQ cutoff)
+# LOQ is calculated for each module (pkc file)
+loq <- data.frame(row.names = colnames(object))
+
+loq.min <- 2
+loq.cutoff <- 2
+
+for(module in modules) {
+  vars <- paste0(c("NegGeoMean_", "NegGeoSD_"),
+                 module)
+  if(all(vars[1:2] %in% colnames(pData(object)))) {
+    
+    neg.geo.mean <- vars[1]
+    neg.geo.sd <- vars[2]
+    
+    loq[, module] <-
+      pmax(loq.min,
+           pData(object)[, neg.geo.mean] * 
+             pData(object)[, neg.geo.sd] ^ loq.cutoff)
+  }
+}
+
+# Store the loq df in the annotation df
+pData(object)$loq <- loq
+
+# Setup a master loq matrix
+loq.mat <- c()
+
+
+for(module in modules) {
+  # Gather rows with the given module
+  ind <- fData(object)$Module == module
+  
+  # Check if each feature has counts above the LOQ
+  mat.i <- t(esApply(object[ind, ], MARGIN = 1,
+                     FUN = function(x) {
+                       x > loq[, module]
+                     }))
+  
+  # Store results in the master loq matrix
+  loq.mat <- rbind(loq.mat, mat.i)
+}
+
+# ensure ordering since this is stored outside of the geomxSet
+loq.mat <- loq.mat[fData(object)$TargetName, ]
+
+# Evaluate and Filter Segment Gene Detection Rate
+# Save detection rate information to pheno data
+pData(object)$GenesDetected <- colSums(loq.mat, na.rm = TRUE)
+pData(object)$GeneDetectionRate <- 100*(pData(object)$GenesDetected / nrow(object))
+
+# Establish detection bins
+detection.bins <- c("less_than_1", "1_5", "5_10", "10_15", "greater_than_15")
+
+# Determine detection thresholds: 1%, 5%, 10%, 15%, >15%
+pData(object)$DetectionThreshold <- 
+  cut(pData(object)$GeneDetectionRate,
+      breaks = c(0, 1, 5, 10, 15, 100),
+      labels = detection.bins)
+
+# stacked bar plot of different cut points (1%, 5%, 10%, 15%)
+segment.stacked.bar.plot<- ggplot(pData(object),
+                          aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = region)) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
+  theme_bw() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate",
+         y = "Segments, #",
+         fill = "Segment Type")
+  
+# cut percent genes detected at 1, 5, 10, 15
+segment.table <- kable(table(pData(object)$DetectionThreshold, 
+                             pData(object)$class))
+
+# Make a list of segments with low detection
+low.detection.segments <- pData(object) %>% 
+  filter(GeneDetectionRate < 5) %>% 
+  select(any_of(c("segmentID", "GeneDetectionRate")))
+
+print(low.detection.segments)
+
+# Export a summary of the segment gene detection
+segment.detection.summary <- pData(object) %>% 
+  select(any_of(c("segmentID", "GeneDetectionRate", "DetectionThreshold")))
+
+export.segment.detection.summary <- FALSE
+
+if(export.segment.detection.summary == TRUE){
+  
+  write.csv(segment.detection.summary, "qc/segment_detection_summary.csv")
+  
+}
+
+```
+
+### Remove Segments
+
+```{r}
+
+# Filter the data using the cutoff for gene detection rate
+segment.gene.rate.cutoff <- 1
+
+object.segment.filtered <-
+    object[, pData(object)$GeneDetectionRate >= segment.gene.rate.cutoff]
+
+
+```
+
+### Gene Filtering by Detection per Segment
+
+```{r}
+library(scales)
+
+# Evaluate and Filter Study-wide Gene Detection Rate 
+# Calculate detection rate:
+loq.mat <- loq.mat[, colnames(object.segment.filtered)]
+
+fData(object.segment.filtered)$DetectedSegments <- rowSums(loq.mat, na.rm = TRUE)
+fData(object.segment.filtered)$DetectionRate <-
+  100*(fData(object.segment.filtered)$DetectedSegments / nrow(pData(object)))
+
+# Establish detection bins
+detection.bins <- c("0", "less_than_1", "1_5", "5_10", "10_20", "20_30", "30_40", "40_50", "greater_than_50")
+
+# Determine detection thresholds: 1%, 5%, 10%, 15%, >15%
+fData(object.segment.filtered)$DetectionThreshold <- 
+  cut(fData(object.segment.filtered)$DetectionRate,
+      breaks = c(-1, 0, 1, 5, 10, 20, 30, 40, 50, 100),
+      labels = detection.bins)
+
+
+gene.stacked.bar.plot <- ggplot(fData(object.segment.filtered),
+                          aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = Module)) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
+  theme_bw() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate",
+         y = "Genes, #",
+         fill = "Probe Set")
+
+
+# Gene of interest detection table
+goi <- c("A2M", "CD44")
+
+goi.table <- data.frame(Gene = goi,
+                        Number = fData(object.segment.filtered)[goi, "DetectedSegments"],
+                        DetectionRate = percent(fData(object.segment.filtered)[goi, "DetectionRate"]))
+print(goi.table)
+
+# Plot detection rate:
+plot.detect <- data.frame(Freq = c(1, 5, 10, 20, 30, 50))
+plot.detect$Number <-
+  unlist(lapply(c(1, 5, 10, 20, 30, 50),
+                function(x) {sum(fData(object.segment.filtered)$DetectionRate >= x)}))
+
+plot.detect$Rate <- plot.detect$Number / nrow(fData(object.segment.filtered))
+rownames(plot.detect) <- plot.detect$Freq
+
+genes.detected.plot <- ggplot(plot.detect, aes(x = as.factor(Freq), y = Rate, fill = Rate)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = formatC(Number, format = "d", big.mark = ",")),
+            vjust = 1.6, color = "black", size = 4) +
+  scale_fill_gradient2(low = "orange2", mid = "lightblue",
+                       high = "dodgerblue3", midpoint = 0.65,
+                       limits = c(0,1),
+                       labels = scales::percent) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "% of Segments",
+       y = "Genes Detected, % of Panel > loq")
+
+
+# Export a summary of the gene detection
+gene.detection.summary <- fData(object.segment.filtered) %>% 
+  select(any_of(c("segmentID", "DetectionRate", "DetectionThreshold")))
+
+export.gene.detection.summary <- FALSE
+
+if(export.gene.detection.summary == TRUE){
+  
+  write.csv(gene.detection.summary, "qc/gene_detection_summary.csv")
+  
+}
+
+```
+
+### Remove Genes
+
+```{r}
+
+# Set the cutoff for gene detection
+study.gene.rate.cutoff <- 0.01
+
+# Subset for genes above the study gene detection rate cutoff
+# Manually include the negative control probe, for downstream use
+negative.probe.fData <- subset(fData(object.segment.filtered), CodeClass == "Negative")
+neg.probes <- unique(negative.probe.fData$TargetName)
+object.gene.filtered <- object.segment.filtered[fData(object.segment.filtered)$DetectionRate >= study.gene.rate.cutoff |
+                   fData(object.segment.filtered)$TargetName %in% neg.probes, ]
+
+```
 
 ## 4. Normalization:
   
 ```{r Normalization, echo=TRUE}
   
     q3.normalization.output <- geomxNorm(
-                                  object = filtering.output$object, 
+                                  object = object.gene.filtered, 
                                   norm = "q3")
     
     print(q3.normalization.output$multi.plot)
@@ -133,12 +348,29 @@ qc.output <-  qcProc(object = sdesign.list$object,
     print(q3.normalization.output$boxplot.norm)
     
     neg.normalization.output <- geomxNorm(
-                                  object = filtering.output$object, 
+                                  object = object.gene.filtered, 
                                   norm = "neg")
     
     print(neg.normalization.output$multi.plot)
     print(neg.normalization.output$boxplot.raw)
     print(neg.normalization.output$boxplot.norm)
+    
+    results.folder <- "results/April22_2024/"
+    
+    # Export normalized counts
+    export.counts <- TRUE
+    if(export.counts == TRUE){ 
+    
+      # Gather the counts
+      norm.counts <-  q3.normalization.output$object@assayData$q_norm
+      
+      # Write to csv
+      write.csv(norm.counts, 
+                file = paste0(results.folder, "q3_norm_counts.csv"))
+      
+      
+    }
+    
 ```
 
 
@@ -166,7 +398,17 @@ qc.output <-  qcProc(object = sdesign.list$object,
  
 ```{r Clustering high CV Genes, echo=TRUE}
     
-    heatmap.output <- heatMap(object = unsupervised.output$object, 
+  anno.colors <- list(
+    region = c(immune = "red", 
+               stroma = "seagreen1", 
+               'stroma/immune' = "olivedrab", 
+               tumor = "darkblue", 
+               vessel = "purple"), 
+    class = c(Biopsy = "orange", 
+              PDX = "springgreen")
+  )  
+
+  heatmap.output <- heatMap(object = unsupervised.output$object, 
                         ngenes = 200, 
                         scale.by.row.or.col = "row", 
                         show.rownames = FALSE, 
@@ -180,104 +422,2089 @@ qc.output <-  qcProc(object = sdesign.list$object,
                         annotation.col = c("class", "region"), 
                         breaks.by.values = seq(-3, 3, 0.05), 
                         heatmap.color = colorRampPalette(c("blue", "white", "red"))(120), 
-                        norm.method = "quant")
+                        norm.method = "quant", 
+                        annotation.colors = anno.colors)
 
 
-    print(heatmap.output$plot)
+     print(heatmap.output$plot)
     
+```
+# 7. Differential Expression
+
+
+
+
+
+```{r}
+
+library(GeomxTools)
+library(dplyr)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+
+# Source the helper functions
+source("DSP_functions.R")
+
+# Results folder where the results should be exported
+results.folder <- "results/April22_2024/"
+
+```
+
+### DE contrast: Skin Biopsy, Tumor (infected) & Vessel (uninfected), Full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor", "vessel")
+source.types <- c("Skin")
+segment.types <- c("full_ROI")
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]], 
+                        "_", 
+                        region.types[[2]])
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "region", 
+                      regions = c("tumor", "vessel"), 
+                      group.col = "Tumor", 
+                      groups = c("Biopsy"), 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = "DE in Tumor", 
+                               x.axis.title = "Infected (Tumor) vs. Uninfected (Vessel)")
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin Biopsy, Tumor (infected) & Immune, Full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor", "immune")
+source.types <- c("Skin")
+segment.types <- c("full_ROI")
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]], 
+                        "_", 
+                        region.types[[2]])
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "region", 
+                      regions = c("tumor", "immune"), 
+                      group.col = "Tumor", 
+                      groups = c("Biopsy"), 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = "DE in Tumor", 
+                               x.axis.title = "Infected (Tumor) vs. Immune")
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
 ```
 
 
-## 7. Differential Expression Analysis:
+### DE contrast: Skin Biopsy, Vessel & Immune, Full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("vessel", "immune")
+source.types <- c("Skin")
+segment.types <- c("full_ROI")
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]], 
+                        "_", 
+                        region.types[[2]])
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
 
 
-```{r Differential Expression Analysis,  echo=TRUE}
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
 
-    goi <- c("CD274", "CD8A", "CD68", "EPCAM",
-             "KRT18", "NPHS1", "NPHS2", "CALB1", "CLDN8")
-    
-    object <- q3.normalization.output$object
-    object <- object[goi,]
-    Gene <- Subset <- NULL
-    
-    #First analysis:
-    reslist.1 <- diffExpr(object = object, 
-                          analysis.type = "Within Groups", 
-                          region.col = "region", 
-                          regions = c("glomerulus", "tubule"), 
-                          group.col = "class", 
-                          groups = c("DKD", "normal"), 
-                          n.cores = 1)
-    grid.draw(reslist.1$sample_table)
-    grid.newpage()
-    grid.draw(reslist.1$summary_table)
-    
-    lfc_col1 <- colnames(reslist.1$result)[grepl("logFC",colnames(reslist.1$result))]
-    pval_col1 <- colnames(reslist.1$result)[grepl("_pval",colnames(reslist.1$result))]
-    
-    lfc.1 <- reslist.1$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "normal") %>% 
-              select(all_of(lfc_col1)) %>% 
-              as.numeric()
-    pval.1 <- reslist.1$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "normal") %>% 
-              select(all_of(pval_col1)) %>% 
-              as.numeric()
-    
-    cat(paste0("\n\nvalue of CALB Fold Change is:", lfc.1))
-    cat("expected value is -2.014")
-    
-    cat(paste0("\nvalue of CALB pval is:",pval.1))
-    cat("expected value is 0.0274")
-    
-    #Second analysis:
-    reslist.2 <- diffExpr(object = object, 
-                          analysis.type = "Between Groups", 
-                          region.col = "region", 
-                          regions = c("glomerulus", "tubule"), 
-                          group.col = "class", 
-                          groups = c("DKD", "normal"), 
-                          n.cores = 1)
-    grid.draw(reslist.2$sample_table)
-    grid.newpage()
-    grid.draw(reslist.2$summary_table)
-    
-    lfc_col2 <- colnames(reslist.2$result)[grepl("logFC",colnames(reslist.2$result))]
-    pval_col2 <- colnames(reslist.2$result)[grepl("_pval",colnames(reslist.2$result))]
-    
-    lfc.2 <- reslist.2$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "tubule") %>% 
-              select(all_of(lfc_col2)) %>% 
-              as.numeric()
-    pval.2 <- reslist.2$result %>% 
-              dplyr::filter(Gene == "CALB1" & Subset == "tubule") %>% 
-              select(all_of(pval_col2)) %>% 
-              as.numeric()
-    
-    cat(paste0("\n\nvalue of CALB Fold Change is:", lfc.2))
-    cat("expected value is -1.408")
-    
-    cat(paste0("\nvalue of CALB pval is:",pval.2))
-    cat("expected value is 0.01268")
-    
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "region", 
+                      regions = region.types, 
+                      group.col = "Tumor", 
+                      groups = tumor.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", region.types[[1]]), 
+                               x.axis.title = paste0(region.types[[1]],
+                                                     " vs. ",
+                                                     region.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
 
 ```
-## 8. Volcano Plot
 
-#This part is run on NIDAP.
 
-## 9. Violin Plot
+### DE contrast: Skin Biopsy & PDX, Tumor, LANA
 
-```{r Violin Plot, echo=TRUE}
-    library(gridExtra)
-    
-    genes <- c("CXCL8")
-    
-    violin.plot.test <- violinPlot(object = q3.normalization.output$object, 
-                                        expr.type = "q_norm", 
-                                        genes = genes,
-                                        group = "region",
-                                        facet.by = "class")
-    grid.arrange(violin.plot.test)
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy", "PDX")
+region.types <- c("tumor")
+source.types <- c("Skin")
+segment.types <- c("LANA_pos")
+paired.samples <- c("TB0118", "323473", 
+                        "TB0133",	"323477",
+                        "TB0144",	"338852",
+                        "TB0164",	"343961")
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types, 
+  "Corrections MOH" = paired.samples)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        tumor.types[[2]], 
+                        "_", 
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "Tumor", 
+                      regions = tumor.types, 
+                      group.col = "Source", 
+                      groups = source.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", tumor.types[[1]]), 
+                               x.axis.title = paste0(tumor.types[[1]],
+                                                     " vs. ",
+                                                     tumor.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
 
 ```
+
+
+### DE contrast: Skin Biopsy & PDX, Tumor, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy", "PDX")
+region.types <- c("tumor")
+source.types <- c("Skin")
+segment.types <- c("full_ROI")
+paired.samples <- c("TB0118", "323473", 
+                        "TB0133",	"323477",
+                        "TB0144",	"338852",
+                        "TB0164",	"343961")
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types, 
+  "Corrections MOH" = paired.samples)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        tumor.types[[2]], 
+                        "_", 
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "Tumor", 
+                      regions = tumor.types, 
+                      group.col = "Source", 
+                      groups = source.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", tumor.types[[1]]), 
+                               x.axis.title = paste0(tumor.types[[1]],
+                                                     " vs. ",
+                                                     tumor.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: GI Biopsy & PDX, Tumor, LANA
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy", "PDX")
+region.types <- c("tumor")
+source.types <- c("GI")
+segment.types <- c("LANA_pos")
+paired.samples <- c("BM3748133", "360174")
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types, 
+  "Corrections MOH" = paired.samples)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        tumor.types[[2]], 
+                        "_", 
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "Tumor", 
+                      regions = tumor.types, 
+                      group.col = "Source", 
+                      groups = source.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", tumor.types[[1]]), 
+                               x.axis.title = paste0(tumor.types[[1]],
+                                                     " vs. ",
+                                                     tumor.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: GI Biopsy & PDX, Tumor, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy", "PDX")
+region.types <- c("tumor")
+source.types <- c("GI")
+segment.types <- c("full_ROI")
+paired.samples <- c("BM3748133", "360174")
+
+# Gather the column names to be used in defining contrasts
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types, 
+  "Corrections MOH" = paired.samples)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        tumor.types[[2]], 
+                        "_", 
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "Tumor", 
+                      regions = tumor.types, 
+                      group.col = "Source", 
+                      groups = source.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", tumor.types[[1]]), 
+                               x.axis.title = paste0(tumor.types[[1]],
+                                                     " vs. ",
+                                                     tumor.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: GI Biopsy, Tumor & Vessel, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor", "vessel")
+source.types <- c("GI")
+segment.types <- c("full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.types <- region.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]], 
+                        "_", 
+                        region.types[[2]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = "region", 
+                      regions = region.types, 
+                      group.col = "Source", 
+                      groups = source.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI Biopsy, Tumor, LANA
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor")
+source.types <- c("Skin", "GI")
+segment.types <- c("LANA_pos")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI PDX, Tumor, LANA
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("PDX")
+region.types <- c("tumor")
+source.types <- c("Skin", "GI")
+segment.types <- c("LANA_pos")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI Biopsy, Tumor, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor")
+source.types <- c("Skin", "GI")
+segment.types <- c("full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI PDX, Tumor, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("PDX")
+region.types <- c("tumor")
+source.types <- c("Skin", "GI")
+segment.types <- c("full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI Biopsy, Vessel, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("vessel")
+source.types <- c("Skin", "GI")
+segment.types <- c("full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+# Gather the column names to be used in defining contrasts
+#contrast.groups.list <- list(
+#  "Tumor" = tumor.types, 
+#  "region" = region.types, 
+#  "segment" = segment.types, 
+#  "Source" = source.types, 
+#  "Corrections MOH" = paired.samples)
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_", 
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+
+### DE contrast: Skin Biopsy, Tumor, LANA & full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor")
+source.types <- c("Skin")
+segment.types <- c("LANA_pos", "full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "segment"
+contrast.types <- segment.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        segment.types[[2]], 
+                        "_",
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin PDX, Tumor, LANA & full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("PDX")
+region.types <- c("tumor")
+source.types <- c("Skin")
+segment.types <- c("LANA_pos", "full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "segment"
+contrast.types <- segment.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        segment.types[[2]], 
+                        "_",
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: GI Biopsy, Tumor, LANA & full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("tumor")
+source.types <- c("GI")
+segment.types <- c("LANA_pos", "full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "segment"
+contrast.types <- segment.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        segment.types[[2]], 
+                        "_",
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+
+### DE contrast: GI PDX, Tumor, LANA & full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("PDX")
+region.types <- c("tumor")
+source.types <- c("GI")
+segment.types <- c("LANA_pos", "full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "segment"
+contrast.types <- segment.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        segment.types[[1]], 
+                        "_", 
+                        segment.types[[2]], 
+                        "_",
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
+### DE contrast: Skin & GI Biopsy, Immune, full ROI
+
+```{r, warning=FALSE}
+
+# Setup annotation groups for the contrast
+tumor.types <- c("Biopsy")
+region.types <- c("immune", "immune/stroma")
+source.types <- c("Skin", "GI")
+segment.types <- c("full_ROI")
+#paired.samples <- c("BM3748133", "360174")
+
+# Define the main contrast
+contrast.column <- "Source"
+contrast.types <- source.types
+
+# A column used for DE that does not have multiple types in this contrast
+group.column <- "Tumor"
+group.types <- tumor.types
+
+contrast.groups.list <- list(
+  "Tumor" = tumor.types, 
+  "region" = region.types, 
+  "segment" = segment.types, 
+  "Source" = source.types)
+
+# Define the name of the contrast
+contrast.name <- paste0(tumor.types[[1]], 
+                        "_",
+                        source.types[[1]], 
+                        "_", 
+                        source.types[[2]], 
+                        "_",
+                        segment.types[[1]], 
+                        "_",
+                        region.types[[1]]
+                        )
+
+# Filter data for the chosen annotations
+object <- q3.normalization.output$object
+
+# Generate the counts, annotation, and subset object for lmm
+lmm.input <- subset_for_lmm(object = object, 
+                                subset.list = contrast.groups.list)
+
+# Create summary table of group counts
+summary.table.df <- pData(lmm.input$subset.object) %>%  
+  select(c(names(contrast.groups.list)))
+
+summary.table <- table(summary.table.df)
+
+print("Sample Numbers per Annotation Group")
+print("-----------------------------------")
+print(summary.table)
+
+# Use the function from the DSPWorkflow package
+
+# Within slide analysis
+# Listed contrasts are condition, reference 
+results.list <- diffExpr(object = lmm.input$subset.object, 
+                      analysis.type = "Within Groups", 
+                      region.col = contrast.column, 
+                      regions = contrast.types, 
+                      group.col = group.column, 
+                      groups = group.types, 
+                      n.cores = parallel::detectCores())
+
+# Create the results df
+results.df <- results.list$results
+
+# Adjust column names
+logfc.column <- colnames(results.df[grepl("logFC",colnames(results.df))])
+results.df$logfc <- results.df[[logfc.column]]
+
+pval.column <- colnames(results.df[grepl("_pval",colnames(results.df))])
+results.df$pval <- results.df[[pval.column]]
+
+adj.pval.column <- colnames(results.df[grepl("adjpval",colnames(results.df))])
+results.df$padj <- results.df[[adj.pval.column]]
+
+results.df$gene <- results.df$Gene
+
+# Keep only the necessary columns
+results.df <- results.df %>% select(c("gene", 
+                                      "logfc", 
+                                      "pval", 
+                                      "padj"))
+
+
+# Export the results
+export.deg.list <- TRUE
+if(export.deg.list == TRUE){ 
+  write.csv(results.df, 
+            file = paste0(results.folder, contrast.name, "_de_results.csv"), 
+            row.names = FALSE)  
+}
+
+# Make the volcano plot
+volcano.output <- make_volcano(lmm.results = results.df, 
+                               title = contrast.name, 
+                               legend.title = paste0("DE in ", contrast.types[[1]]), 
+                               x.axis.title = paste0(contrast.types[[1]],
+                                                     " vs. ",
+                                                     contrast.types[[2]]))
+
+# Export the volcano
+export.volcano <- TRUE
+if(export.volcano == TRUE){ 
+  ggsave(filename = paste0(results.folder, contrast.name, "_volcano_plot.pdf"), 
+         width = 10, 
+         height = 10)
+}
+
+```
+
