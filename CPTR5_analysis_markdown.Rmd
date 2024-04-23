@@ -374,24 +374,275 @@ object.gene.filtered <- object.segment.filtered[fData(object.segment.filtered)$D
 ```
 
 
-## 5. Unsupervised Analysis:
+# 5. PCA Analysis:
+
+## Setup
 
 ```{r Unsupervised Analysis, echo=TRUE}
 
-    #Test Unsupervised Analysis:
-    unsupervised.output <- dimReduct(object = q3.normalization.output$object,
-                        point.size = 2,
-                        point.alpha = 0.5,
-                        color.variable1 = "region",
-                        shape.variable = "class"
-    )
-    
-    print(unsupervised.output$plot$PCA)
-    print(unsupervised.output$plot$tSNE)
-    print(unsupervised.output$plot$UMAP)
+library(PCAtools)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(GeomxTools)
+library(gridExtra)
+library(grid)
+
+
+object <- q3.normalization.output$object
+
+
+# Load the normalized counts
+norm.counts <- object@assayData$q_norm
+
+log.counts <- as.data.frame(log(norm.counts, base = 2))
+
+# Load and clean up the annotation
+annotation <- pData(object)
+
+# Order of rownames of annotation need to match columns of count data
+cleaned.annotation.df <- annotation[order(rownames(annotation)), ]
+
+log.counts.cleaned <- as.data.frame(log.counts[, order(colnames(log.counts))])
+
+# Create a function for the main PCA annotations
+
+main_annotation_PCA <- function(pca.table){
+  
+  # Create a PCA for the main annotations, then group together
+  
+  pca.plot.slide <- biplot(pca.table, 
+                         colby = "slide_name", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = NULL, 
+                         subtitle = "Slide Analysis")
+                         
+  pca.plot.region <- biplot(pca.table, 
+                         colby = "region", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = NULL, 
+                         subtitle = "Region analysis")
+  
+  pca.plot.segment <- biplot(pca.table, 
+                         colby = "segment", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = NULL, 
+                         subtitle = "Segment Analysis")
+  
+  pca.plot.class <- biplot(pca.table, 
+                         colby = "class", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = NULL, 
+                         subtitle = "Class Analysis")
+  
+  
+  combined.plot <- arrangeGrob(ggplotGrob(pca.plot.slide), 
+                               ggplotGrob(pca.plot.region), 
+                               ggplotGrob(pca.plot.segment), 
+                               ggplotGrob(pca.plot.class), 
+                               nrow = 2, ncol = 2)
+  
+  return(combined.plot)
+  
+}
+
 
 ```
 
+## PCA analysis for all AOIs
+
+```{r}
+# Generate a PCA table for all samples
+pca.table <- pca(log.counts.cleaned, 
+                 metadata = cleaned.annotation.df, 
+                 removeVar = 0.1)
+
+all.aoi.pca <- main_annotation_PCA(pca.table = pca.table)
+
+ggsave("results/April23_2024/all_aoi_pca.pdf", all.aoi.pca, width = 14, height = 12)
+
+
+# Extra PCAs
+pca.plot.gene.detect <- biplot(pca.table, 
+                         colby = "DetectionThreshold", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "All AOIs", 
+                         subtitle = "by Gene Detection")
+
+
+```
+
+
+## PCA analysis for only immune AOIs 
+
+```{r}
+
+# Subset annotation
+annotation.immune <- cleaned.annotation.df %>% 
+  filter(region %in% c("immune", "immune/stroma"))
+
+# Subset counts
+log.counts.immune <- log.counts.cleaned %>% 
+  select(rownames(annotation.immune))
+
+pca.immune <- pca(log.counts.immune, 
+                 metadata = annotation.immune, 
+                 removeVar = 0.1)
+
+all.aoi.pca <- main_annotation_PCA(pca.table = pca.immune)
+
+ggsave("results/April23_2024/immune_pca.pdf", all.aoi.pca, width = 14, height = 12)
+
+```
+
+## PCA analysis with immune/stroma removed
+
+```{r}
+
+# Subset annotation
+annotation.stroma.removed <- cleaned.annotation.df %>% 
+  filter(region != "immune/stroma")
+
+# Subset counts
+log.counts.stroma.removed <- log.counts.cleaned %>% 
+  select(rownames(annotation.stroma.removed))
+
+pca.stroma.removed <- pca(log.counts.stroma.removed, 
+                 metadata = annotation.stroma.removed, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.stroma.removed)
+
+ggsave("results/April23_2024/stroma_removed_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
+
+## PCA analysis for tumor only
+
+```{r}
+
+# Subset annotation
+annotation.tumor <- cleaned.annotation.df %>% 
+  filter(region == "tumor")
+
+# Subset counts
+log.counts.tumor <- log.counts.cleaned %>% 
+  select(rownames(annotation.tumor))
+
+pca.tumor <- pca(log.counts.tumor, 
+                 metadata = annotation.tumor, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.tumor)
+
+ggsave("results/April23_2024/tumor_only_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
+
+
+## PCA analysis for skin only
+
+```{r}
+
+# Subset annotation
+annotation.skin <- cleaned.annotation.df %>% 
+  filter(Source == "Skin")
+
+# Subset counts
+log.counts.skin <- log.counts.cleaned %>% 
+  select(rownames(annotation.skin))
+
+pca.skin <- pca(log.counts.skin, 
+                 metadata = annotation.skin, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.skin)
+
+ggsave("results/April23_2024/skin_only_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
+
+## PCA analysis for GI only
+
+```{r}
+
+# Subset annotation
+annotation.gi <- cleaned.annotation.df %>% 
+  filter(Source == "GI")
+
+# Subset counts
+log.counts.gi <- log.counts.cleaned %>% 
+  select(rownames(annotation.gi))
+
+pca.gi <- pca(log.counts.gi, 
+                 metadata = annotation.gi, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.gi)
+
+ggsave("results/April23_2024/gi_only_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
+
+## PCA analysis for Full ROI only
+
+```{r}
+
+# Subset annotation
+annotation.full_roi <- cleaned.annotation.df %>% 
+  filter(segment == "full_ROI")
+
+# Subset counts
+log.counts.full_roi <- log.counts.cleaned %>% 
+  select(rownames(annotation.full_roi))
+
+pca.full_roi <- pca(log.counts.full_roi, 
+                 metadata = annotation.full_roi, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.full_roi)
+
+ggsave("results/April23_2024/full_roi_only_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
+
+
+## PCA analysis for LANA+ only
+
+```{r}
+
+# Subset annotation
+annotation.lana <- cleaned.annotation.df %>% 
+  filter(segment == "LANA_pos")
+
+# Subset counts
+log.counts.lana <- log.counts.cleaned %>% 
+  select(rownames(annotation.lana))
+
+pca.lana <- pca(log.counts.lana, 
+                 metadata = annotation.lana, 
+                 removeVar = 0.1)
+
+pca.plot <- main_annotation_PCA(pca.table = pca.lana)
+
+ggsave("results/April23_2024/lana_only_pca.pdf", pca.plot, width = 14, height = 12)
+
+```
 
 ## 6. Clustering high CV Genes and Heatmap:
 
