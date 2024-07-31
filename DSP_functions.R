@@ -1,3 +1,8 @@
+
+# Required libraries for functions
+library(pheatmap)
+
+
 subset_for_lmm <- function(object, 
                               subset.list){ 
   
@@ -23,8 +28,13 @@ subset_for_lmm <- function(object,
   assayDataElement(object = subset.object, elt = "log_q") <-
     assayDataApply(subset.object, 2, FUN = log, base = 2, elt = "q_norm")
   
+  assayDataElement(object = subset.object, elt = "log_raw") <-
+    assayDataApply(subset.object, 2, FUN = log, base = 2, elt = "exprs")
+  
+  
   # Gather the log counts and annotation to return
   log.counts <- subset.object@assayData$log_q
+  raw.log.counts <- subset.object@assayData$log_raw
   annotation.df <- pData(subset.object)
   
   # Replace all bad characters in column names
@@ -33,6 +43,7 @@ subset_for_lmm <- function(object,
   
   return(list("subset.object" = subset.object, 
               "log.counts" = log.counts, 
+              "raw.log.counts" = raw.log.counts, 
               "annotation" = annotation.df))
   
 }
@@ -170,7 +181,8 @@ run_lmm <- function(object, contrast, within.slide){
 make_volcano <- function(lmm.results, 
                          title, 
                          legend.title, 
-                         x.axis.title){ 
+                         x.axis.title, 
+                         fc.limit = 1){ 
   
   ## Make a volcano plot for the comparison
   
@@ -184,9 +196,9 @@ make_volcano <- function(lmm.results,
   # Create a column for direction of DEGs
   lmm.results$de_direction <- "NONE"
   lmm.results$de_direction[lmm.results$padj < 0.05 & 
-                         lmm.results$logfc > 1.0] <- "UP"
+                         lmm.results$logfc > fc.limit] <- "UP"
   lmm.results$de_direction[lmm.results$padj < 0.05 & 
-                         lmm.results$logfc < -1.0] <- "DOWN"
+                         lmm.results$logfc < -fc.limit] <- "DOWN"
   
   # Create a label for DEGs
   lmm.results$deglabel <- ifelse(lmm.results$de_direction == "NONE", 
@@ -205,7 +217,7 @@ make_volcano <- function(lmm.results,
                                              y = -log10(padj), 
                                              col = de_direction, 
                                              label = deglabel)) +
-    geom_vline(xintercept = c(-1, 1), col = "gray", linetype = 'dashed') +
+    geom_vline(xintercept = c(-fc.limit, fc.limit), col = "gray", linetype = 'dashed') +
     geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') + 
     xlim(-7.5, 7.5) + 
     labs(x = x.axis.title,
@@ -220,4 +232,178 @@ make_volcano <- function(lmm.results,
   
   return(list("volcano.plot" = volcano.plot))
   
+}
+
+region.types <- c("tumor", "vessel")
+
+# Set up the MA plot table
+make_MA <- function(contrast.field, 
+                    condition.label, 
+                    reference.label, 
+                    results.df, 
+                    log.counts, 
+                    raw.log.counts, 
+                    annotation){
+  
+  # Gather the sample IDs for condition and reference groups
+  condition.samples <- rownames(annotation[annotation[[contrast.field]] == condition.label, ])
+  reference.samples <- rownames(annotation[annotation[[contrast.field]] == reference.label, ])
+  
+  # Gather normalized and raw counts for both groups
+  condition.counts <- as.data.frame(log.counts[, condition.samples])
+  reference.counts <- as.data.frame(log.counts[, reference.samples])
+  
+  condition.raw.counts <- as.data.frame(raw.log.counts[, condition.samples])
+  reference.raw.counts <- as.data.frame(raw.log.counts[, reference.samples])  
+  
+  # Get the mean log score for each gene for both 
+  # normalized counts
+  condition.row.order <- rownames(condition.counts)
+  condition.counts <- as.data.frame(sapply(condition.counts, as.numeric))
+  condition.counts$cond_mean <- rowMeans(condition.counts)
+  condition.counts$gene <- condition.row.order
+  
+  reference.row.order <- rownames(reference.counts)
+  reference.counts <- as.data.frame(sapply(reference.counts, as.numeric))
+  reference.counts$ref_mean <- rowMeans(reference.counts)
+  reference.counts$gene <- reference.row.order
+  
+  # raw counts
+  condition.row.order <- rownames(condition.raw.counts)
+  condition.raw.counts <- as.data.frame(sapply(condition.raw.counts, as.numeric))
+  condition.raw.counts$cond_raw_mean <- rowMeans(condition.raw.counts)
+  condition.raw.counts$gene <- condition.row.order
+  
+  reference.row.order <- rownames(reference.raw.counts)
+  reference.raw.counts <- as.data.frame(sapply(reference.raw.counts, as.numeric))
+  reference.raw.counts$ref_raw_mean <- rowMeans(reference.raw.counts)
+  reference.raw.counts$gene <- reference.row.order
+  
+  
+  # Create a new data frame of the gene and group means with M and A values
+  normalized.counts <- merge(condition.counts, reference.counts, by = "gene") %>% 
+    select(gene, cond_mean, ref_mean) %>% 
+    mutate(M.value = cond_mean - ref_mean) %>% 
+    mutate(A.value = (cond_mean + ref_mean)/2)
+  
+  raw.counts <- merge(condition.raw.counts, reference.raw.counts, by = "gene") %>% 
+    select(gene, cond_raw_mean, ref_raw_mean) %>% 
+    mutate(M.raw.value = cond_raw_mean - ref_raw_mean) %>% 
+    mutate(A.raw.value = (cond_raw_mean + ref_raw_mean)/2)
+  
+  # Add the DE results and log counts together
+  ma.plot.counts <- merge(normalized.counts, raw.counts, by = "gene")
+  
+  # Set the bounds for the y axix so that they are aligned
+  min.y <- min(c(min(ma.plot.counts$M.value),min(ma.plot.counts$M.raw.value)))
+  max.y <- max(c(max(ma.plot.counts$M.value),max(ma.plot.counts$M.raw.value)))
+  
+  ma.plot.norm <- ggplot(ma.plot.counts, aes(x = A.value, y = M.value)) +
+    geom_point(alpha = 0.5, col = "black") + 
+    geom_smooth(method=lm, col="steelblue1") + 
+    geom_hline(yintercept = 0, lty = "dashed") + 
+    labs(x = "Average log expression",
+         y = paste0("log(", condition.label, ") - log(", reference.label, ")"), 
+         title = "Post-normalization") + 
+    ylim(min.y, max.y) + 
+    theme_classic()
+  
+  ma.plot.raw <- ggplot(ma.plot.counts, aes(x = A.raw.value, y = M.raw.value)) + 
+    geom_point(alpha = 0.5, col = "black") + 
+    geom_smooth(method=lm, col="steelblue1") + 
+    geom_hline(yintercept = 0, lty = "dashed") + 
+    labs(x = "Average log expression",
+         y = paste0("log(", condition.label, ") - log(", reference.label, ")"), 
+         title = "Pre-normalization") + 
+    ylim(min.y, max.y) + 
+    theme_classic()
+  
+  combined.MA.plots <- arrangeGrob(ggplotGrob(ma.plot.raw), 
+                               ggplotGrob(ma.plot.norm), 
+                               nrow = 1, ncol = 2)
+  
+  return(combined.MA.plots)
+  
+  
+  
+  
+}
+
+run_GSEA <- function(){
+  
+  
+  
+}
+
+make_heatmap <- function(normalized.log.counts.df, 
+                         de.results, 
+                         top.degs, 
+                         annotation.column, 
+                         annotation.row = NULL, 
+                         anno.colors, 
+                         cluster.rows = FALSE, 
+                         cluster.columns = FALSE, 
+                         main.title, 
+                         row.gaps = NULL, 
+                         column.gaps = NULL, 
+                         show.rownames = FALSE){
+  
+  
+  # Filter genes by top DEGs, if applicable
+  if(top.degs == TRUE){ 
+    
+    # Arrange by adjusted p-value
+    degs.df <- de.results %>% 
+      filter(padj < 0.05) %>% 
+      arrange(desc(padj))
+    
+    # If there are more then 500 DEGs, trim down to top 500
+    if(length(rownames(degs.df)) > 500){
+      degs.df <- degs.df %>% slice(1:500)
+    }
+    
+    # Arrange by log FC
+    degs.df <- degs.df %>% arrange(desc(logfc))
+    
+    # Grab the list of DEGs
+    degs.list <- degs.df$gene
+    
+    # Subset the counts df for the DEGs and order based on the DEGs list
+    counts <- normalized.log.counts.df[rownames(normalized.log.counts.df) %in% degs.list, ]
+    counts <- counts[match(degs.list, rownames(counts)), ]
+    
+  } else {
+    
+    counts <- normalized.log.counts.df
+    
   }
+  
+  heatmap.plot <- pheatmap(counts, 
+                            main = main.title, 
+                            show_rownames = show.rownames, 
+                            scale = "row",   
+                            show_colnames = FALSE,
+                            border_color = NA, 
+                            cluster_rows = cluster.rows, 
+                            cluster_cols = cluster.columns, 
+                            clustering_method = "average", 
+                            clustering_distance_rows = "correlation", 
+                            clustering_distance_cols = "correlation", 
+                            color = colorRampPalette(c("blue", "white", "red"))(120), 
+                            annotation_row = annotation.row, 
+                            annotation_col = annotation.column,  
+                            annotation_colors = anno.colors, 
+                            gaps_row = row.gaps, 
+                            gaps_col = column.gaps, 
+                           fontsize_row = 4)
+  
+  
+  return(heatmap.plot)
+  
+}
+
+
+calculate_signal2noise <- function(){
+  
+  
+}
