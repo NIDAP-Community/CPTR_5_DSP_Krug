@@ -1,0 +1,623 @@
+---
+title: "DSP DE Analysis - CPTR 5 Krug Sci Trans Med 2026"
+format:
+  html:
+    code-fold: true
+editor: visual
+
+params:
+  data.folder: "/Users/cauleyes/CPTR/CPTR-5_Krug_Ramaswami/NIDAP_Workbook_Restoration/"
+  de.folder: "/Users/cauleyes/CPTR/CPTR-5_Krug_Ramaswami/NIDAP_Workbook_Restoration/de/"
+  dataset.name: "Krug_skin_only"
+  dsp.analysis.folder: "/Users/cauleyes/CPTR/DSP_Analysis/"
+---
+
+# DE Analysis
+
+```{r Setup}
+#| warning: false
+#| message: false
+
+library(GeomxTools)
+library(dplyr)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(PCAtools)
+library(readxl)
+library(gridExtra)
+library(grid)
+library(DSPWorkflow)
+library(standR)
+library(SpatialExperiment)
+
+# Source the helper functions
+source(paste0(params$dsp.analysis.folder, "DSP_functions.R"))
+
+#de.results.files <- list.files(params$de.folder)
+```
+
+### Load the Normalized Counts and Annotation
+
+```{r Load Normalized Counts}
+
+normalized.object <- readRDS(file = paste0(params$data.folder,
+                                                 params$dataset.name, 
+                                                 "_normalized_object.RDS"))
+
+
+```
+
+## Main DE Analysis Function
+
+```{r de-helper-functions}
+#| warning: false
+#| message: false
+
+# Use the left-hand value unless it is NULL; otherwise use the default on the right.
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
+standardize_de_results <- function(results.df) {
+  
+  # Find the core fields in the DE results
+  logfc.column <- grep("logFC", colnames(results.df), value = TRUE)
+  pval.column <- grep("_pval", colnames(results.df), value = TRUE)
+  adj.pval.column <- grep("adjpval", colnames(results.df), value = TRUE)
+  
+  # Checks
+  if (length(logfc.column) != 1) {
+    stop("Expected exactly one logFC column, found: ",
+         paste(logfc.column, collapse = ", "))
+  }
+
+  if (length(pval.column) != 1) {
+    stop("Expected exactly one _pval column, found: ",
+         paste(pval.column, collapse = ", "))
+  }
+
+  if (length(adj.pval.column) != 1) {
+    stop("Expected exactly one adjpval column, found: ",
+         paste(adj.pval.column, collapse = ", "))
+  }
+
+  # The final organized df 
+  data.frame(
+    gene = results.df$Gene,
+    logfc = results.df[[logfc.column]],
+    pval = results.df[[pval.column]],
+    padj = results.df[[adj.pval.column]],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Check the previously saved de output
+validate_cached_results <- function(results.df, result.file) {
+  required.cols <- c("gene", "logfc", "pval", "padj")
+
+  if (!all(required.cols %in% colnames(results.df))) {
+    stop(
+      "Cached DE result file does not contain the expected columns: ",
+      result.file,
+      "\nExpected columns: ",
+      paste(required.cols, collapse = ", ")
+    )
+  }
+
+  
+  # Ensure proper formatting
+  results.df <- results.df %>%
+    dplyr::select(dplyr::all_of(required.cols))
+
+  results.df$logfc <- as.numeric(results.df$logfc)
+  results.df$pval <- as.numeric(results.df$pval)
+  results.df$padj <- as.numeric(results.df$padj)
+
+  results.df
+}
+
+# For labelling genes in the volcano plots with too many DEGs to label all
+get_top_gene_labels <- function(results.df,
+                                fc.limit = 1.5,
+                                padj.limit = 0.05,
+                                n = 10) {
+  down <- results.df %>%
+    filter(!is.na(logfc), !is.na(padj)) %>%
+    filter(logfc < -fc.limit, padj < padj.limit) %>%
+    arrange(padj, logfc)
+
+  up <- results.df %>%
+    filter(!is.na(logfc), !is.na(padj)) %>%
+    filter(logfc > fc.limit, padj < padj.limit) %>%
+    arrange(padj, desc(logfc))
+
+  unique(c(
+    head(down$gene, n),
+    head(up$gene, n)
+  ))
+}
+
+
+make_de_volcano <- function(results.df,
+                            comp.params,
+                            custom.labels = NULL,
+                            remove.all.gene.labels = FALSE,
+                            label.size = NULL) {
+  improved_make_volcano(
+    lmm.results = results.df,
+    title = comp.params$volcano.title %||% comp.params$heading %||% comp.params$contrast.name,
+    title.size = comp.params$title.size %||% 22,
+    legend.title = comp.params$legend.title %||% "Expression",
+    fc.limit = comp.params$fc.limit %||% 1.5,
+    custom.gene.labels = custom.labels,
+    remove.controls = comp.params$remove.controls %||% FALSE,
+    remove.genes = comp.params$remove.genes %||% NULL,
+    remove.all.gene.labels = remove.all.gene.labels,
+    legend.coordinates = comp.params$legend.coordinates %||% c(.99, .1),
+    x.lab = comp.params$x.lab %||% "Log2 Fold Change",
+    y.lab = comp.params$y.lab %||% "-Log10 adjusted p-value",
+    dotted.line.color = comp.params$dotted.line.color %||% "black",
+    alpha = comp.params$alpha %||% 1,
+    nonDE.color = comp.params$nonDE.color %||% "gray60",
+    upDE.color = comp.params$upDE.color %||% "red",
+    downDE.color = comp.params$downDE.color %||% "blue",
+    label.size = label.size %||% comp.params$label.size %||% 8,
+    label.color = comp.params$label.color %||% "black",
+    axis.tick.label.size = comp.params$axis.tick.label.size %||% 20,
+    legend.text.size = comp.params$legend.text.size %||% 20,
+    axis.title.size = comp.params$axis.title.size %||% 20
+  )
+}
+
+
+run_de_comparison <- function(comp.params, normalized.object, params) {
+  heading <- comp.params$heading %||% comp.params$contrast.name
+  
+  # For the summary of sample sizes per comparison group
+  cat("\n\n#### ", heading, "\n\n", sep = "")
+
+  lmm.input <- subset_object_for_lmm(
+    object = normalized.object,
+    subset.group.1 = comp.params$subset.group.1,
+    subset.group.2 = comp.params$subset.group.2
+  )
+  
+  summary.cols <- union(
+    names(comp.params$subset.group.1),
+    names(comp.params$subset.group.2)
+  )
+
+  summary.table.df <- pData(lmm.input$subset.object) %>%
+    dplyr::select(dplyr::all_of(summary.cols))
+
+  summary.table <- as.data.frame(
+    table(summary.table.df),
+    stringsAsFactors = FALSE
+  )
+
+  cat("**Sample numbers per annotation group**\n\n")
+  cat(knitr::kable(summary.table), sep = "\n")
+  cat("\n\n")
+
+  result.file <- file.path(
+    params$de.folder,
+    paste0(comp.params$contrast.name, "_de.results.csv")
+  )
+
+  # Check for previous de results
+  if (file.exists(result.file) && !isTRUE(comp.params$overwrite.results %||% FALSE)) {
+    results.df <- read.csv(
+      result.file,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+
+    results.df <- validate_cached_results(results.df, result.file)
+
+    cat("*Loaded existing DE results.*\n\n")
+  } else {
+    results.list <- diffExpr(
+      object = lmm.input$subset.object,
+      analysis.type = comp.params$analysis.type %||% "Within Groups",
+      region.col = comp.params$region.col,
+      regions = comp.params$regions,
+      group.col = comp.params$group.col,
+      groups = comp.params$groups,
+      n.cores = comp.params$n.cores %||% parallel::detectCores()
+    )
+
+    results.df <- standardize_de_results(results.list$results)
+
+    if (isTRUE(comp.params$write.results %||% TRUE)) {
+      dir.create(params$de.folder, showWarnings = FALSE, recursive = TRUE)
+
+      write.csv(
+        results.df,
+        result.file,
+        row.names = FALSE
+      )
+
+      cat("*Wrote DE results to disk.*\n\n")
+    }
+  }
+
+  fc.limit <- comp.params$fc.limit %||% 1.5
+  padj.limit <- comp.params$padj.limit %||% 0.05
+
+  total.down.reg.degs <- sum(
+    results.df$logfc < -fc.limit & results.df$padj < padj.limit,
+    na.rm = TRUE
+  )
+
+  total.up.reg.degs <- sum(
+    results.df$logfc > fc.limit & results.df$padj < padj.limit,
+    na.rm = TRUE
+  )
+
+  cat(
+    "**DEGs at |log2FC| > ",
+    fc.limit,
+    " and padj < ",
+    padj.limit,
+    ":** ",
+    total.up.reg.degs,
+    " up, ",
+    total.down.reg.degs,
+    " down\n\n",
+    sep = ""
+  )
+  
+  # For labelling specific genes on the volcano plot
+  custom.labels <- comp.params$custom.gene.labels %||% NULL
+
+  if (isTRUE(comp.params$label.top.genes %||% FALSE)) {
+    custom.labels <- get_top_gene_labels(
+      results.df = results.df,
+      fc.limit = fc.limit,
+      padj.limit = padj.limit,
+      n = comp.params$n.labels %||% 10
+    )
+  }
+
+  volcano.plot <- make_de_volcano(
+    results.df = results.df,
+    comp.params = comp.params,
+    custom.labels = custom.labels,
+    remove.all.gene.labels = comp.params$remove.all.gene.labels %||% FALSE,
+    label.size = comp.params$label.size %||% 8
+  )
+
+  print(volcano.plot)
+
+  # Useful for insrtances where there are many DEGs so labels will overlap and clutter plot
+  volcano.plot.nolabel <- NULL
+
+  if (
+    isTRUE(comp.params$make.nolabel.volcano %||% FALSE) ||
+    isTRUE(comp.params$export.volcano.nolabel %||% FALSE)
+  ) {
+    volcano.plot.nolabel <- make_de_volcano(
+      results.df = results.df,
+      comp.params = comp.params,
+      custom.labels = NULL,
+      remove.all.gene.labels = TRUE,
+      label.size = comp.params$nolabel.label.size %||% 4
+    )
+  }
+  
+  # Create a directory for the volcano plots
+  if (
+    isTRUE(comp.params$export.volcano %||% FALSE) ||
+    isTRUE(comp.params$export.volcano.nolabel %||% FALSE)
+  ) {
+    volcano.dir <- file.path(params$de.folder, "volcano")
+    
+    if(!dir.exists(volcano.dir)){
+      dir.create(volcano.dir, showWarnings = FALSE, recursive = TRUE)
+      print(paste0("Created volcano directory at: ", volcano.dir))
+    }
+    
+  }
+  
+  
+  if (isTRUE(comp.params$export.volcano %||% FALSE)) {
+    ggsave(
+      filename = file.path(
+        params$de.folder,
+        "volcano",
+        paste0(comp.params$contrast.name, "_volcano_plot.png")
+      ),
+      plot = volcano.plot,
+      width = comp.params$volcano.width %||% 14,
+      height = comp.params$volcano.height %||% 10
+    )
+    
+    print(paste0("Volcano plot saved to: ", 
+                 file.path(params$de.folder, "volcano",
+                           paste0(comp.params$contrast.name, 
+                                  "_volcano_plot.png")))
+          )
+    
+  }
+
+  if (isTRUE(comp.params$export.volcano.nolabel %||% FALSE)) {
+    ggsave(
+      filename = file.path(
+        params$de.folder,
+        "volcano",
+        paste0(comp.params$contrast.name, "_volcano_plot_nolabel.png")
+      ),
+      plot = volcano.plot.nolabel,
+      width = comp.params$volcano.width %||% 14,
+      height = comp.params$volcano.height %||% 10
+    )
+  }
+  
+  gsea.preranked.df <- gsea_preranked_list(
+    contrast.field = comp.params$gsea.contrast.field %||% comp.params$region.col,
+    contrast.levels = comp.params$gsea.contrast.levels %||% comp.params$regions,
+    annotation = lmm.input$subset.annotation,
+    log.counts = lmm.input$subset.object@assayData$log_q
+  )
+  
+  gsea.input.list <- list(preranked_df = gsea.preranked.df, 
+                        annotation_df = lmm.input$subset.annotation)
+
+  if (isTRUE(comp.params$export.gsea.input %||% FALSE)) {
+    gsea.dir <- file.path(params$data.folder, "gsea", "input_lists")
+    dir.create(gsea.dir, showWarnings = FALSE, recursive = TRUE)
+
+    write.csv(
+      gsea.preranked.df,
+      file = file.path(
+        gsea.dir,
+        paste0(comp.params$contrast.name, "_gsea_preranked_input.csv")
+      ),
+      row.names = FALSE
+    )
+    
+    # Useful for accesing the AOIs for a comparison to create a pathway heatmap
+    saveRDS(gsea.input.list, 
+          file = file.path(
+            gsea.dir, 
+            paste0(comp.params$contrast.name, 
+                        "_gsea_input_list.RDS"))
+          )
+    
+  }
+
+  invisible(
+    list(
+      contrast.name = comp.params$contrast.name,
+      summary.table = summary.table,
+      results = results.df,
+      gsea.preranked = gsea.preranked.df
+    )
+  )
+}
+```
+
+## Comparison Parameters
+
+```{r de-comparison-config}
+#| warning: false
+#| message: false
+
+
+# Parameters shared across all comparisons
+common.comparison.parameters <- list(
+  
+  # Volcano Parameters
+  fc.limit = 1,
+  padj.limit = 0.05,
+  n.labels = 10,
+
+  write.results = TRUE,
+  overwrite.results = FALSE,
+
+  title.size = 22,
+  legend.coordinates = c(.99, .01),
+  x.lab = paste0("Log2 Fold Change"), 
+  y.lab = paste0("-Log10 FDR"),
+  dotted.line.color = "black",
+  alpha = 0.75,
+  nonDE.color = "black",
+  upDE.color = "red",
+  downDE.color = "blue",
+  label.size = 10,
+  nolabel.label.size = 4,
+  label.color = "black",
+  axis.tick.label.size = 20,
+  legend.text.size = 20,
+  axis.title.size = 20,
+
+  volcano.width = 14,
+  volcano.height = 10, 
+  
+  label.top.genes = FALSE,
+  make.nolabel.volcano = TRUE,
+
+  export.volcano = TRUE,
+  export.volcano.nolabel = TRUE,
+  export.gsea.input = TRUE
+)
+
+# Individual Comparisons with unique parameters
+de.comparisons <- list(
+  
+  # Add unique paramaters for each comparison
+  modifyList(
+    common.comparison.parameters,
+    list(
+      contrast.name = "Biopsy_LANA_vs_fullROITumor",
+      heading = "Biopsy LANA+ vs. Full ROI Tumor",
+
+      subset.group.1 = list(
+        class = c("Biopsy_Skin"),
+        region = c("tumor"),
+        segment = c("LANA_pos")
+      ),
+
+      subset.group.2 = list(
+        class = c("Biopsy_Skin"),
+        region = c("tumor"),
+        segment = c("full_ROI")
+      ),
+
+      # DE function
+      analysis.type = "Within Groups",
+      region.col = "segment",
+      regions = c("LANA_pos", "full_ROI"),
+      group.col = "class",
+      groups = c("Biopsy_Skin"),
+      legend.title = "Expression in LANA+",
+
+      # Volcano Plot
+      volcano.title = "LANA+ Segmented ROIs vs. Tumor ROIs in Biopsy",
+      label.top.genes = FALSE, 
+      
+      # GSEA
+      gsea.contrast.field = "segment",
+      gsea.contrast.levels = c("LANA_pos", "full_ROI")
+
+    )
+  ), 
+  # Add unique paramaters for each comparison
+  modifyList(
+    common.comparison.parameters,
+    list(
+      contrast.name = "PDX_LANA_vs_fullROITumor",
+      heading = "PDX LANA+ vs. Full ROI Tumor",
+
+      subset.group.1 = list(
+        class = c("PDX_Skin"),
+        region = c("tumor"),
+        segment = c("LANA_pos")
+      ),
+
+      subset.group.2 = list(
+        class = c("PDX_Skin"), 
+        region = c("tumor"),
+        segment = c("full_ROI")
+      ),
+
+      # DE function
+      analysis.type = "Within Groups",
+      region.col = "segment",
+      regions = c("LANA_pos", "full_ROI"),
+      group.col = "class",
+      groups = c("PDX_Skin"),
+      legend.title = "Expression in LANA+",
+
+      # Volcano Plot
+      volcano.title = "LANA+ Segmented ROIs vs. Tumor ROIs in PDX",
+      label.top.genes = FALSE, 
+      
+      # GSEA
+      gsea.contrast.field = "segment",
+      gsea.contrast.levels = c("LANA_pos", "full_ROI")
+
+    )
+  ),
+  
+  modifyList(
+    common.comparison.parameters,
+    list(
+      contrast.name = "Tumor_PDX_vs_Biopsy",
+      heading = "Tumor PDX vs Biopsy",
+
+      subset.group.1 = list(
+        class = c("PDX_Skin"), 
+        region = c("tumor")
+      ),
+
+      subset.group.2 = list(
+        class = c("Biopsy_Skin"), 
+        region = c("tumor")
+      ),
+
+      # DE function
+      analysis.type = "Within Groups",
+      region.col = "class",
+      regions = c("PDX_Skin", "Biopsy_Skin"),
+      group.col = "region",
+      groups = c("tumor"),
+      legend.title = "Expression in PDX",
+
+      # Volcano Plot
+      volcano.title = "Tumor ROIs, PDX vs. Biopsy",
+      label.top.genes = FALSE, 
+      
+      # GSEA
+      gsea.contrast.field = "class",
+      gsea.contrast.levels = c("PDX_Skin", "Biopsy_Skin")
+
+    )
+  ), 
+  
+  modifyList(
+    common.comparison.parameters,
+    list(
+      contrast.name = "LANA_PDX_vs_Biopsy",
+      heading = "LANA+, PDX vs Biopsy",
+
+      subset.group.1 = list(
+        class = c("PDX_Skin"), 
+        segment = c("LANA_pos")
+      ),
+
+      subset.group.2 = list(
+        class = c("Biopsy_Skin"), 
+        segment = c("LANA_pos")
+      ),
+
+      # DE function
+      analysis.type = "Within Groups",
+      region.col = "class",
+      regions = c("PDX_Skin", "Biopsy_Skin"),
+      group.col = "segment",
+      groups = c("LANA_pos"),
+      legend.title = "Expression in PDX",
+
+      # Volcano Plot
+      volcano.title = "LANA+ segmented ROIs, PDX vs. Biopsy",
+      label.top.genes = FALSE, 
+      
+      # GSEA
+      gsea.contrast.field = "class",
+      gsea.contrast.levels = c("PDX_Skin", "Biopsy_Skin")
+
+    )
+  )
+  
+  
+
+)
+
+```
+
+#### Run The Comparisons
+
+```{r run-de-comparisons}
+#| warning: false
+#| message: false
+#| results: asis
+#| fig-width: 14
+#| fig-height: 10
+
+de.outputs <- stats::setNames(
+  vector("list", length(de.comparisons)),
+  vapply(de.comparisons, function(x) x$contrast.name, character(1))
+)
+
+for (i in seq_along(de.comparisons)) {
+  de.outputs[[i]] <- run_de_comparison(
+    comp.params = de.comparisons[[i]],
+    normalized.object = normalized.object,
+    params = params
+  )
+}
+```

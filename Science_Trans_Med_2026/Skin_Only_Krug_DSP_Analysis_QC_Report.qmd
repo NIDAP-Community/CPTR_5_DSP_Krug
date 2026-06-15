@@ -1,0 +1,1282 @@
+---
+title: "Krug Skin Only - DSP Analysis QC Report"
+format:
+  html:
+    code-fold: true
+editor: visual
+#css: "qc_report_style.css"
+
+params:
+  dsp.analysis.folder: "/Users/cauleyes/CPTR/DSP_Analysis/"
+  data.folder: "/Users/cauleyes/CPTR/CPTR-5_Krug_Ramaswami/data/"
+  results.folder: "/Users/cauleyes/CPTR/CPTR-5_Krug_Ramaswami/results/"
+  project.folder: "/Users/cauleyes/CPTR/CPTR-5_Krug_Ramaswami/"
+  run.folder: "qc_report/"
+  dataset.name: "Krug_skin_only"
+---
+
+## Load Libraries
+
+```{r Load Libraries}
+#| warning: false
+#| message: false
+
+# Load all relevant libraries
+
+library(DSPWorkflow)
+library(GeomxTools)
+library(dplyr)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(ggforce)
+library(shadowtext)
+library(stringr)
+library(PCAtools)
+library(readxl)
+library(gridExtra)
+library(grid)
+library(knitr)
+library(gt)
+library(tidyr)
+library(openxlsx)
+library(ComplexUpset)
+library(reshape2)
+library(cowplot)
+library(preprocessCore)
+
+source(paste0(params$dsp.analysis.folder, "DSP_QC_functions.R"))
+```
+
+## Initialization
+
+```{r Initialization}
+
+# Input file parameters
+
+pkc.file.name <- "Hs_R_NGS_WTA_v1.0.pkc"
+pkc.file.path <- paste0(params$data.folder, pkc.file.name)
+
+annotation.file.name <- "annotation_Krug_CPTR_5_October_2024_NC_edit_SK_Skin_metadata.xlsx"
+annotation.file.path <- paste0(params$project.folder, "NIDAP_Workbook_Restoration/", annotation.file.name)
+
+dcc.files.skin <- list.files(file.path(paste0(params$data.folder, "dcc_skin_subset")),
+  pattern = ".dcc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+dcc.files <- list.files(file.path(paste0(params$data.folder, "dcc")),
+  pattern = ".dcc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+# Annotation parameters
+annotation.sheet.name <- "annotation"
+sample.id.field.name <- "Sample_ID"
+roi.field.name <- "ROI"
+panel.field.name <- "panel"
+class.field.name <- "class"
+region.field.name <- "Region"
+segment.field.name <- "segment"
+area.field.name <- "area"
+nuclei.field.name <- "nuclei"
+exclude.sankey <- FALSE
+segment.id.length <- 8
+
+# Create the GeoMxSet Object
+
+init.object <- initialize_object(dcc.files = dcc.files,
+                            pkc.files = pkc.file.path,
+                            annotation.file = annotation.file.path,
+                            annotation.sheet.name = annotation.sheet.name,
+                            sample.id.field.name = sample.id.field.name,
+                            roi.field.name = roi.field.name,
+                            panel.field.name = panel.field.name, 
+                            class.field.name = class.field.name, 
+                            region.field.name = region.field.name, 
+                            segment.field.name = segment.field.name,
+                            area.field.name = area.field.name,
+                            nuclei.field.name = nuclei.field.name, 
+                            segment.id.length = segment.id.length)
+
+```
+
+## Object Summary
+
+@fig-sankey shows a summary of AOIs per annotation
+
+```{r Object Summary, fig.width=12, fig.height=8}
+#| label: fig-sankey
+#| fig-cap: "Sankey Plot"
+#| warning: false
+
+sankey.output <- plot_sankey(object = init.object, 
+                      lane.1 = "slide_name", 
+                      lane.1.order = c("_1B", "_2", "_3", "_4"), 
+                      lane.2 = "class", 
+                      lane.2.order = c("Biopsy_Skin", "PDX_Skin"), 
+                      lane.3 = "region", 
+                      lane.3.order = c("tumor", "vessel"), 
+                      lane.4 = "segment", 
+                      lane.4.order = c("LANA_pos", "full_ROI"), 
+                      fill.lane = "region")
+
+print(sankey.output$sankey.plot)
+```
+
+@fig-aoibarplot shows the total AOI counts per annotation
+
+```{r AOI Count Bar Plot, fig.width=12, fig.height=8}
+#| label: fig-aoibarplot
+#| fig-cap: "AOI Count Bar Plot"
+#| warning: false
+
+print(sankey.output$AOI.bar.plot)
+```
+
+## QC and Filtering
+
+```{r QC and Filtering}
+
+
+qc.output <-  qcProc(object = init.object,
+                        min.segment.reads = 1000, 
+                        percent.trimmed = 80,    
+                        percent.stitched = 75,   
+                        percent.aligned = 80,    
+                        percent.saturation = 50, 
+                        min.negative.count = 1,   
+                        max.ntc.count = 9000,     
+                        min.nuclei = 20,         
+                        min.area = 1000,
+                        print.plots = FALSE, 
+                     shift.counts.zero = FALSE, 
+                     remove.local.outliers = TRUE
+                     )
+    
+
+```
+
+Summary of QC for AOIs and Probes
+
+```{r QC Summary}
+
+qc.output$table
+
+```
+
+#### AOI QC
+
+AOI distribution by parameter and annotation
+
+```{r AOI Plots}
+
+# Print AOI plots
+qc.output$plot$trimmed
+qc.output$plot$aligned
+qc.output$plot$stitched
+qc.output$plot$saturated
+qc.output$plot$neg.plot
+
+
+```
+
+AOIs that have been flagged with the given QC parameters
+
+aoi.flag.table \<- aoi_flag_table(aoi.flags = qc.output\$segment.flags)
+
+print(aoi.flag.table)
+
+```{r AOI Flags}
+
+aoi.flag.table <- aoi_flag_table(aoi.flags = qc.output$segment.flags)
+
+aoi.flag.table
+
+```
+
+### Probe QC
+
+Probes that have been flagged as either local or global outliers.
+
+```{r Probe Flag Tables}
+
+
+probe.flag.output <- probe_flag_table(probe.flags = qc.output$probe.flags, 
+                                      object = qc.output$object)
+
+probe.flag.output$probe.flag.summary
+
+probe.flag.output$probe.flags.table
+
+
+```
+
+### Filtering
+
+```{r Filtering}
+
+# Add LOQ and calculate detection of genes per AOI
+loq.detection.output <- loq_detection(object = qc.output$object, 
+              pkc.file.names = pkc.file.name)
+```
+
+#### Overall Gene Detection per AOI
+
+@fig-GeneDetectionbByAOI shows detection rate per AOI, colored by region.
+
+```{r Overall AOI Detection}
+#| label: fig-AOIDetection
+#| tbl-cap: "AOI Detection"
+#| warning: false
+
+aoi.detection <- aoi_detection(object = loq.detection.output$object)
+
+print(aoi.detection$detection.bar.plot)
+
+```
+
+AOIs in the low detection bin of 1-5%
+
+```{r Low Detection AOI}
+#| warning: false
+#| message: false
+
+aoi.detection$low.detection.table
+
+```
+
+```{r Gene Detection All AOIs}
+#| warning: false
+#| message: false
+
+# Store the AOI detection for export in the QC summary
+aoi.detection.summary <- pData(loq.detection.output$object) %>% 
+  select(any_of(c("segmentID", "GeneDetectionRate", "DetectionThreshold")))
+
+```
+
+##### Filter out AOIs with low detection
+
+```{r Filter by AOI}
+#| warning: false
+#| message: false
+
+# Filter the data using the cutoff for gene detection rate
+aoi.gene.rate.cutoff <- 10
+
+object <- loq.detection.output$object
+
+object.aoi.filtered <-
+    object[, pData(object)$GeneDetectionRate >= aoi.gene.rate.cutoff]
+
+# Create a table of AOIs that are filtered out
+aoi.filtered.out <- pData(object[, pData(object)$GeneDetectionRate < aoi.gene.rate.cutoff])
+
+aoi.filtered.out.table <- aoi.filtered.out %>% 
+  select(segmentID, GeneDetectionRate) %>% 
+  gt() %>% 
+  tab_header(title = "AOIs Filtered Out", 
+             subtitle = paste0(aoi.gene.rate.cutoff, "% Cutoff"), preheader = NULL)
+
+aoi.filtered.out.table
+
+```
+
+#### Detection per Gene
+
+```{r Detection per Gene}
+#| warning: false
+#| message: false
+
+# Rerun LOQ to calculate new detection rate for individual genes:
+loq.detection.output.aoi.filtered <- loq_detection(object = object.aoi.filtered, 
+                                      pkc.file.names = pkc.file.name)
+```
+
+@fig-GeneDetection shows the gene detection as a percent of all AOIs
+
+```{r Gene Detection Plot}
+#| label: fig-GeneDetection
+#| fig-cap: "Gene Detection Percent of All AOIs"
+#| warning: false
+
+gene.detection <- gene_detection(object = loq.detection.output.aoi.filtered$object, 
+                                    facet.column = "region", 
+                                    loq.mat = loq.detection.output.aoi.filtered$loq.matrix)
+
+print(gene.detection$total.plot)
+```
+
+@fig-FacetGeneDetection shows the gene detection as a percent of all AOIs per annotation group
+
+```{r Facet Gene Detection Plot}
+#| label: fig-FacetGeneDetection
+#| fig-cap: "Gene Detection Percent of All AOIs per Annotation Group"
+#| warning: false
+
+print(gene.detection$facet.plot)
+
+```
+
+Gene detection rates for specified genes of interest
+
+```{r Genes of Interest}
+#| label: tbl-GenesOfInterest
+#| tbl-cap: "Gene of Interest Detection Rate"
+#| warning: false
+
+# Gene of interest detection table
+goi <- c("A2M", "CD44")
+
+goi.df <- data.frame(Gene = goi,
+                     Number = fData(loq.detection.output.aoi.filtered$object)[goi, "DetectedSegments"],
+                     DetectionRate = fData(loq.detection.output.aoi.filtered$object)[goi, "DetectionRate"])
+
+# Print the GOI table
+goi.table <- goi.df %>% gt()
+
+goi.table
+```
+
+@fig-DetectionPerGeneLoss shows the loss of percentage of all AOIs individual genes are detected within
+
+```{r Gene Detection Rates Loss Plot}
+#| label: fig-DetectionPerGeneLoss
+#| fig-cap: "Gene Detection Loss"
+#| warning: false
+
+print(gene.detection$detect.loss.plot)
+
+```
+
+Summary of all gene detection rates
+
+```{r Gene Detection Rate Summary}
+#| warning: false
+#| message: false
+
+# Gather a summary of the every gene's detection percentage in all AOIs
+gene.detection.summary <- fData(loq.detection.output.aoi.filtered$object) %>% 
+  mutate(gene = rownames(fData(loq.detection.output.aoi.filtered$object))) %>% 
+  select(any_of(c("gene", "DetectionRate", "DetectionThreshold")))
+
+
+```
+
+##### Filter out genes with low detection
+
+```{r Filter Genes}
+#| warning: false
+#| message: false
+
+# Set the cutoff for gene detection (percentage)
+gene.detection.cutoff <- 10
+
+# Manually include the negative control probe, for downstream use
+negative.probe.fData <- subset(fData(loq.detection.output.aoi.filtered$object), CodeClass == "Negative")
+neg.probes <- unique(negative.probe.fData$TargetName)
+
+# Subset for genes above the study gene detection rate cutoff
+object.gene.filtered <- loq.detection.output.aoi.filtered$object[fData(loq.detection.output.aoi.filtered$object)$DetectionRate >= gene.detection.cutoff |
+                   fData(loq.detection.output.aoi.filtered$object)$TargetName %in% neg.probes, ]
+
+# Create a summary of genes that are filtered out
+genes.filtered.out <- fData(loq.detection.output.aoi.filtered$object[fData(loq.detection.output.aoi.filtered$object)$DetectionRate < gene.detection.cutoff, ])
+
+print(paste0(nrow(genes.filtered.out), " genes were filtered out of the GeoMxSet Object. For the full list, check the QC Output File."))
+
+```
+
+**Write QC Output File**
+
+```{r Write QC output}
+
+write.qc.file <- TRUE
+
+if(write.qc.file == TRUE){
+  
+  # Start the QC output excel workbook
+  qc.info.output <- createWorkbook()
+  
+  # Add the AOI flag info to the output file
+  addWorksheet(qc.info.output, "AOI QC Flags")
+  writeData(qc.info.output, sheet = "AOI QC Flags", qc.output$segment.flags)
+  
+  # Add the probe flag QC info to the output file
+  addWorksheet(qc.info.output, "Probe QC Flags")
+  writeData(qc.info.output, sheet = "Probe QC Flags", probe.flag.output$probe.flags.table)
+
+  # Add the AOI detection QC info
+  addWorksheet(qc.info.output, "AOI Detection Rate")
+  writeData(qc.info.output, sheet = "AOI Detection Rate", aoi.detection.summary)
+  
+  # Add the Gene detection QC info to the output file
+  addWorksheet(qc.info.output, "Gene Detection Rate")
+  writeData(qc.info.output, sheet = "Gene Detection Rate", gene.detection.summary)
+  
+  # Save the QC output file
+  saveWorkbook(qc.info.output, paste0(params$results.folder, params$run.folder, "QC_info.xlsx"), overwrite = TRUE)
+  
+}
+
+
+```
+
+#### Q3 versus Negative Background
+
+```{r Visualize Density of Q3 Scores versus Negative Background, warning=FALSE, message=FALSE}
+#| label: fig-densityQ3vsBackground
+#| fig-cap: "Density of Q3 Normalized Counts versus Background"
+#| warning: false
+
+plot.distribution <- plot_distribution(object = object.gene.filtered, 
+                                       facet.annotation = "region")
+
+print(plot.distribution$distr.plots)
+
+
+```
+
+### Normalization
+
+```{r Normalization, warning=FALSE, message=FALSE}
+
+q3.normalization.output <- geomxNorm(
+                                  object = object.gene.filtered, 
+                                  norm = "q3")
+    
+    
+neg.normalization.output <- geomxNorm(
+                                  object = object.gene.filtered, 
+                                  norm = "neg")
+
+
+# Quantile normalization
+quantile.normalization.counts <- normalize.quantiles(object.gene.filtered@assayData$exprs)
+
+dimnames(quantile.normalization.counts) = dimnames(object.gene.filtered@assayData$exprs)
+
+quantile.normalization.counts <- as.data.frame(quantile.normalization.counts)
+
+
+# Set up the mapping df for AOI IDs
+mapping.df.segmentID <- data.frame(sample_ID = rownames(annotation), 
+                         segmentID = annotation$segmentID)
+
+
+# Q3 normalization clean up
+object <- q3.normalization.output$object
+q3.counts <- as.data.frame(object@assayData$q_norm)
+  
+# Add genes as a column and move to the left
+q3.counts$gene <- rownames(q3.counts)
+q3.counts <- q3.counts %>% 
+  select(gene, everything())
+
+# Replace the sampleID column names with human readable AOI ID
+colnames(q3.counts)[match(mapping.df.segmentID$sample_ID, colnames(q3.counts))] <- mapping.df.segmentID$segmentID
+
+export.counts <- FALSE
+
+if(export.counts){
+  
+  write.csv(q3.counts, file = paste0(params$project.folder, 
+                                     "NIDAP_Workbook_Restoration/", 
+                                     params$dataset.name, "_q3normalized_counts.csv"), 
+            row.names = FALSE)
+  
+}
+    
+
+export.q3norm.object <- FALSE 
+if(export.q3norm.object == TRUE){
+  
+  object <- q3.normalization.output$object
+  annotation <-pData(object)
+  counts <- object@assayData$q_norm
+  
+  saveRDS(object, 
+          file = paste0(params$project.folder, 
+                        "NIDAP_Workbook_Restoration/", 
+                        params$dataset.name, "_normalized_object.RDS"))
+}   
+
+
+```
+
+#### RLE Plots
+
+```{r RLE Plots}
+#| warning: false
+#| message: false
+
+# Counts
+raw.counts <- q3.normalization.output$object@assayData$exprs
+q3.counts <- q3.normalization.output$object@assayData$q_norm
+neg.counts <- neg.normalization.output$object@assayData$neg_norm
+
+# Annotation
+annotation <- pData(q3.normalization.output$object)
+
+# Annotation to groupo by
+annotation.facet <- "slide_name"
+
+# The ammount to subsample, with 1 being no subsampling
+subsample.ammount <- 0.8
+
+raw.rle <- make_rle_plot(counts = raw.counts, 
+                         annotation = annotation, 
+                         annotation.facet = annotation.facet, 
+                         subsample.ammount = subsample.ammount)
+
+q3.rle <- make_rle_plot(counts = q3.counts, 
+                         annotation = annotation, 
+                         annotation.facet = annotation.facet, 
+                         subsample.ammount = subsample.ammount)
+
+neg.rle <- make_rle_plot(counts = neg.counts, 
+                         annotation = annotation, 
+                         annotation.facet = annotation.facet, 
+                         subsample.ammount = subsample.ammount)
+
+quant.rle <- make_rle_plot(counts = quantile.normalization.counts, 
+                         annotation = annotation, 
+                         annotation.facet = annotation.facet, 
+                         subsample.ammount = subsample.ammount)
+
+
+print(raw.rle)
+print(q3.rle)
+print(neg.rle)
+print(quant.rle)
+
+
+
+```
+
+#### **Example AOIs**
+
+```{r Normalization Effects on Counts, fig.width=12, fig.height=8}
+#| label: fig-NormEffects
+#| fig-cap: "Normalization Effects on Counts"
+#| warning: false
+#| message: false
+
+# The raw counts boxplot
+transform1.raw<- exprs(q3.normalization.output$object[,1:30])
+transform2.raw<- as.data.frame(transform1.raw)
+transform3.raw<- melt(transform2.raw)
+ggboxplot.raw <- ggplot(transform3.raw, aes(variable, value)) +
+  stat_boxplot(geom = "errorbar") +
+  geom_boxplot(fill="grey") +
+  scale_y_log10() +
+  xlab("Example AOIs") + 
+  ylab("Counts, Raw") +
+  ggtitle("Neg Norm Counts") +
+  scale_x_discrete(labels=c(1:30))
+
+# The Q3 normalized counts boxplot
+transform1.norm <- assayDataElement(q3.normalization.output$object[,1:30], elt = "q_norm")
+transform2.norm <- as.data.frame(transform1.norm)
+transform3.norm <- melt(transform2.norm)
+ggboxplot.q3norm <- ggplot(transform3.norm, aes(variable, value)) +
+  stat_boxplot(geom = "errorbar") +
+  geom_boxplot(fill="cadetblue2") +
+  scale_y_log10() +
+  xlab("Example AOIs") + 
+  ylab("Counts, Q3 Normalized") +
+  ggtitle("Q3 Norm Counts") +
+  scale_x_discrete(labels=c(1:30))
+
+# The Negative normalized counts boxplot
+transform1.norm <- assayDataElement(neg.normalization.output$object[,1:30], elt = "neg_norm")
+transform2.norm <- as.data.frame(transform1.norm)
+transform3.norm <- melt(transform2.norm)
+ggboxplot.negnorm <- ggplot(transform3.norm, aes(variable, value)) +
+  stat_boxplot(geom = "errorbar") +
+  geom_boxplot(fill="indianred") +
+  scale_y_log10() +
+  xlab("Example AOIs") + 
+  ylab("Counts, Neg. Normalized") +
+  ggtitle("Neg Norm Counts") +
+  scale_x_discrete(labels=c(1:30))
+
+# The Negative normalized counts boxplot
+transform1.norm <- quantile.normalization.counts[,1:30]
+transform2.norm <- melt(transform1.norm)
+ggboxplot.quantnorm <- ggplot(transform2.norm, aes(variable, value)) +
+  stat_boxplot(geom = "errorbar") +
+  geom_boxplot(fill="darkseagreen") +
+  scale_y_log10() +
+  xlab("Example AOIs") + 
+  ylab("Counts, Neg. Normalized") +
+  ggtitle("Neg Norm Counts") +
+  scale_x_discrete(labels=c(1:30))
+
+print(ggboxplot.raw)
+print(ggboxplot.q3norm)
+print(ggboxplot.negnorm)
+print(ggboxplot.quantnorm)
+
+
+```
+
+#### Principal Component Analysis (PCA)
+
+```{r PCA, warning=FALSE, message=FALSE}
+
+# See reference vignette: https://bioconductor.org/packages/release/bioc/vignettes/PCAtools/inst/doc/PCAtools.html#introduction
+
+# Load the Geomx objects
+object.q3 <- q3.normalization.output$object
+object.neg <- neg.normalization.output$object
+
+# Gather the the normalized counts
+q3.norm.counts.df <- as.data.frame(object.q3@assayData$q_norm)
+neg.norm.counts.df <- as.data.frame(object.neg@assayData$neg_norm)
+quant.norm.counts.df <- quantile.normalization.counts
+
+# Convert counts to log2
+q3.log.counts.df <- q3.norm.counts.df %>% 
+  mutate_all(~ log2(.)) %>% 
+  rename_all(~ gsub("\\.dcc", "", .))
+neg.log.counts.df <- neg.norm.counts.df %>% 
+  mutate_all(~ log2(.)) %>% 
+  rename_all(~ gsub("\\.dcc", "", .))
+quant.log.counts.df <- quant.norm.counts.df %>% 
+  mutate_all(~ log2(.)) %>% 
+  rename_all(~ gsub("\\.dcc", "", .))
+
+
+# Remove the negative controls from the log counts
+control.probes <- c("NegProbe-WTX")
+q3.log.counts.df <- q3.log.counts.df[!(rownames(q3.log.counts.df) %in% control.probes), ]
+neg.log.counts.df <- neg.log.counts.df[!(rownames(neg.log.counts.df) %in% control.probes), ]
+quant.log.counts.df <- quant.log.counts.df[!(rownames(quant.log.counts.df) %in% control.probes), ]
+
+
+# Load the annotation (same for both normalization types)
+annotation <- pData(object.q3)
+
+# Remove NTCs
+cleaned.annotation.df <- as.data.frame(annotation[annotation$'slide_name' != "No Template Control", ])
+
+# Order of rownames of annotation need to match columns of count data
+cleaned.annotation.df <- cleaned.annotation.df[order(rownames(cleaned.annotation.df)), ]
+
+q3.log.counts.df <- q3.log.counts.df[order(colnames(q3.log.counts.df))]
+neg.log.counts.df <- neg.log.counts.df[order(colnames(neg.log.counts.df))]
+quant.log.counts.df <- quant.log.counts.df[order(colnames(quant.log.counts.df))]
+
+# Remove .dcc from Sample ID row names
+cleaned.annotation.df <- cleaned.annotation.df %>% `rownames<-`(sub("\\.dcc", "", rownames(.)))
+
+# Generate a PCA table for all samples for both normalization types
+q3.pca.table <- pca(q3.log.counts.df, 
+                 metadata = cleaned.annotation.df, 
+                 removeVar = 0.1)
+neg.pca.table <- pca(neg.log.counts.df, 
+                 metadata = cleaned.annotation.df, 
+                 removeVar = 0.1)
+quant.pca.table <- pca(quant.log.counts.df, 
+                 metadata = cleaned.annotation.df, 
+                 removeVar = 0.1)
+
+```
+
+#### PCA by Segment
+
+```{r PCA for Q3 segment, fig.width=12, fig.height=8}
+#| label: fig-PCAsegmentQ3
+#| fig-cap: "PCA colored by Segment for Q3 Normalization"
+#| warning: false
+
+q3.pca.plot.segment <- biplot(q3.pca.table, 
+                         colby = "segment", 
+                         legendPosition = "right", 
+                         legendLabSize = 6, 
+                         legendIconSize = 3, 
+                         lab = NULL,
+                         title = "Q3 Normalization", 
+                         subtitle = "NTCs removed")
+
+print(q3.pca.plot.segment)
+
+```
+
+```{r PCA for Negative segment, fig.width=12, fig.height=8}
+#| label: fig-PCAsegmentNeg
+#| fig-cap: "PCA colored by Segment for Negative Normalization"
+#| warning: false
+
+neg.pca.plot.segment <- biplot(neg.pca.table, 
+                         colby = "segment", 
+                         legendPosition = "right", 
+                         legendLabSize = 6, 
+                         legendIconSize = 3, 
+                         lab = NULL,
+                         title = "Negative Normalization", 
+                         subtitle = "NTCs removed")
+
+print(neg.pca.plot.segment)
+
+```
+
+#### PCA by Region
+
+```{r PCA for Q3 region, fig.width=12, fig.height=8}
+#| label: fig-PCAregionQ3
+#| fig-cap: "PCA colored by Region for Q3 Normalization"
+#| warning: false
+
+q3.pca.plot.region <- biplot(q3.pca.table, 
+                         colby = "region", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Q3 Normalization", 
+                         subtitle = "NTCs removed")
+
+
+print(q3.pca.plot.region)
+
+```
+
+```{r PCA for Neg region, fig.width=12, fig.height=8}
+#| label: fig-PCAregionNeg
+#| fig-cap: "PCA colored by Region for Negative Normalization"
+#| warning: false
+
+neg.pca.plot.region <- biplot(neg.pca.table, 
+                         colby = "region", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Negative Normalization", 
+                         subtitle = "NTCs removed")
+
+print(neg.pca.plot.region)
+
+```
+
+#### PCA by Class
+
+```{r PCA for Q3 class, fig.width=12, fig.height=8}
+#| label: fig-PCAclassQ3
+#| fig-cap: "PCA colored by Class for Q3 Normalization"
+#| warning: false
+
+q3.pca.plot.class <- biplot(q3.pca.table, 
+                         colby = "class", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Q3 Normalization", 
+                         subtitle = "NTCs removed")
+
+print(q3.pca.plot.class)
+
+```
+
+```{r PCA for Negative class, fig.width=12, fig.height=8}
+#| label: fig-PCAclassNeg
+#| fig-cap: "PCA colored by Class for Negative Normalization"
+#| warning: false
+
+neg.pca.plot.class <- biplot(neg.pca.table, 
+                         colby = "class", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Negative Normalization", 
+                         subtitle = "NTCs removed")
+
+print(neg.pca.plot.class)
+
+```
+
+#### PCA by Slide
+
+```{r PCA for Q3 slide, fig.width=12, fig.height=8}
+#| label: fig-PCAslideQ3
+#| fig-cap: "PCA colored by Slide for Q3 Normalization"
+#| warning: false
+
+
+q3.pca.plot.slide <- biplot(q3.pca.table, 
+                         colby = "slide_name", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Q3 Normalization", 
+                         subtitle = "NTCs removed")
+
+print(q3.pca.plot.slide)
+
+```
+
+```{r PCA for Neg slide, fig.width=12, fig.height=8}
+#| label: fig-PCAslideNeg
+#| fig-cap: "PCA colored by Slide for Negative Normalization"
+#| warning: false
+
+neg.pca.plot.slide <- biplot(neg.pca.table, 
+                         colby = "slide_name", 
+                         legendPosition = "right", 
+                         legendLabSize = 10, 
+                         legendIconSize = 5, 
+                         lab = NULL,
+                         title = "Negative Normalization", 
+                         subtitle = "NTCs removed")
+
+print(neg.pca.plot.slide)
+
+```
+
+### PCA for Publication
+
+#### Supp Figure 6E
+
+```{r}
+
+
+object.q3 <- q3.normalization.output$object 
+
+# Gather the the normalized counts
+q3.norm.counts.df <- as.data.frame(object.q3@assayData$q_norm)
+
+# Convert counts to log2
+q3.log.counts.df <- q3.norm.counts.df %>% mutate_all(~ log2(.)) %>% rename_all(~ gsub("\\.dcc", "", .))
+
+# Remove the negative controls from the log counts
+control.probes <- c("NegProbe-WTX")
+q3.log.counts.df <- q3.log.counts.df[!(rownames(q3.log.counts.df) %in% control.probes), ]
+
+# Load the annotation (same for both normalization types)
+annotation <- pData(object.q3)
+rownames(annotation) <- rownames(pData(object.q3))
+annotation$sample_ID <- rownames(annotation)
+
+# Remove NTCs
+cleaned.annotation.df <- as.data.frame(annotation[annotation$'slide_name' != "No Template Control", ])
+
+# Order of rownames of annotation need to match columns of count data
+cleaned.annotation.df <- cleaned.annotation.df[order(rownames(cleaned.annotation.df)), ]
+
+q3.log.counts.df <- q3.log.counts.df[order(colnames(q3.log.counts.df))]
+
+# Remove .dcc from Sample ID row names
+cleaned.annotation.df$sample_ID <- sub("\\.dcc", "", cleaned.annotation.df$sample_ID)
+
+# Combine Class and Region into a combined field
+cleaned.annotation.df$class_region_segment <- paste0(cleaned.annotation.df$class, "_", cleaned.annotation.df$region, "_", cleaned.annotation.df$segment)
+
+# Create a mapping for the sample_name combination
+all.samples <- c("SB-22-2963", 
+ "SB-18-4726", 
+ "SB-22-696", 
+ "SB-22-2794", 
+ "323473", 
+ "TB0118", 
+ "TB0133", 
+ "323477", 
+ "TB0144", 
+ "338852", 
+ "TB0164", 
+ "343961")
+
+combined.samples <- c("SB-22-2963", 
+ "SB-18-4726", 
+ "SB-22-696", 
+ "SB-22-2794", 
+ "TB0118 / 323473", 
+ "TB0118 / 323473", 
+ "TB0133 / 323477", 
+ "TB0133 / 323477", 
+ "TB0144 / 338852", 
+ "TB0144 / 338852", 
+ "TB0164 / 343961", 
+ "TB0164 / 343961")
+ 
+sample_mapping <- as.data.frame(list(sample_name = all.samples, 
+ combined_sample_name = combined.samples))
+
+cleaned.annotation.df <- merge(cleaned.annotation.df, sample_mapping, by = "sample_name")
+
+# Run the PCA 
+pca.stats <- prcomp(t(q3.log.counts.df), scale. = TRUE)
+pca.stats.X1_2 <- as.data.frame(pca.stats$x) %>% select("PC1", "PC2")
+
+# Column for mapping
+pca.stats.X1_2$sample_ID <- rownames(pca.stats.X1_2)
+
+# Create a combined PC and metadata df
+subset.annotation <- cleaned.annotation.df %>% select(sample_ID, combined_sample_name, class_region_segment)
+
+# Set the colors and shapes for the pca plot
+color.mapping <- c("SB-22-2963" = "darkorange", 
+ "SB-18-4726" = "cyan3", 
+ "SB-22-696" = "hotpink", 
+ "SB-22-2794" = "purple", 
+ "TB0118 / 323473" = "yellow3", 
+ "TB0133 / 323477" = "black", 
+ "TB0144 / 338852" = "blue", 
+ "TB0164 / 343961" = "brown")
+
+shape.mapping <- c("Biopsy_Skin_tumor_LANA_pos" = 17, 
+ "Biopsy_Skin_vessel_full_ROI" = 16, 
+ "Biopsy_Skin_tumor_full_ROI" = 15, 
+ "PDX_Skin_tumor_LANA_pos" = 11, 
+ "PDX_Skin_tumor_full_ROI" = 23)
+
+pca.annotation.df <- merge(subset.annotation, pca.stats.X1_2, by = "sample_ID")
+
+# Rename columns for the legend
+pca.annotation.df$`Type` <- pca.annotation.df$class_region_segment
+pca.annotation.df$`Name` <- pca.annotation.df$combined_sample_name
+
+# Create the scatter plot
+pca.plot <- ggplot(pca.annotation.df, aes(x = PC1, 
+ y = PC2, 
+ color = Name, 
+ shape = Type, 
+ fill = Name)) +
+ geom_point(size = 3, alpha = 0.8) + 
+ scale_color_manual(values = color.mapping) + 
+ scale_shape_manual(values = shape.mapping) + 
+ scale_fill_manual(values = color.mapping) + 
+  theme(
+   axis.title = element_text(size = 18),
+   axis.text = element_text(size = 16),
+   legend.title = element_text(size = 16),
+   legend.text = element_text(size = 14)
+ )
+
+
+print(pca.plot)
+
+export <- FALSE
+if(export){
+  
+  ggsave(filename = paste0(params$results.folder, "NIDAP_results/pca/PCA_Supp_Fig6E.png"), 
+         pca.plot, 
+         height = 10,
+         width = 12)
+  
+}
+
+```
+
+#### Supp Figure 6D
+
+```{r}
+
+
+object.q3 <- q3.normalization.output$object 
+
+ # Gather the the normalized counts
+ q3.norm.counts.df <- as.data.frame(object.q3@assayData$q_norm)
+
+# Convert counts to log2
+q3.log.counts.df <- q3.norm.counts.df %>% mutate_all(~ log2(.)) %>% rename_all(~ gsub("\\.dcc", "", .))
+
+# Remove the negative controls from the log counts
+control.probes <- c("NegProbe-WTX")
+q3.log.counts.df <- q3.log.counts.df[!(rownames(q3.log.counts.df) %in% control.probes), ]
+
+# Load the annotation (same for both normalization types)
+annotation <- pData(object.q3)
+rownames(annotation) <- rownames(pData(object.q3))
+annotation$sample_ID <- rownames(annotation)
+
+# Remove NTCs
+cleaned.annotation.df <- as.data.frame(annotation[annotation$'slide_name' != "No Template Control", ])
+
+# Order of rownames of annotation need to match columns of count data
+cleaned.annotation.df <- cleaned.annotation.df[order(rownames(cleaned.annotation.df)), ]
+
+q3.log.counts.df <- q3.log.counts.df[order(colnames(q3.log.counts.df))]
+
+# Remove .dcc from Sample ID row names
+cleaned.annotation.df$sample_ID <- sub("\\.dcc", "", cleaned.annotation.df$sample_ID)
+
+# Combine Class and Region into a combined field
+cleaned.annotation.df$class_region_segment <- paste0(cleaned.annotation.df$class, "_", cleaned.annotation.df$region, "_", cleaned.annotation.df$segment)
+
+# Create a mapping for the sample_name combination
+all.samples <- c("SB-22-2963", 
+ "SB-18-4726", 
+ "SB-22-696", 
+ "SB-22-2794", 
+ "323473", 
+ "TB0118", 
+ "TB0133", 
+ "323477", 
+ "TB0144", 
+ "338852", 
+ "TB0164", 
+ "343961")
+
+combined.samples <- c("SB-22-2963", 
+ "SB-18-4726", 
+ "SB-22-696", 
+ "SB-22-2794", 
+ "TB0118 / 323473", 
+ "TB0118 / 323473", 
+ "TB0133 / 323477", 
+ "TB0133 / 323477", 
+ "TB0144 / 338852", 
+ "TB0144 / 338852", 
+ "TB0164 / 343961", 
+ "TB0164 / 343961")
+ 
+sample_mapping <- as.data.frame(list(sample_name = all.samples, 
+ combined_sample_name = combined.samples))
+
+cleaned.annotation.df <- merge(cleaned.annotation.df, sample_mapping, by = "sample_name")
+
+# Run the PCA 
+pca.stats <- prcomp(t(q3.log.counts.df), scale. = TRUE)
+pca.stats.X1_2 <- as.data.frame(pca.stats$x) %>% select("PC1", "PC2")
+
+# Column for mapping
+pca.stats.X1_2$sample_ID <- rownames(pca.stats.X1_2)
+
+# Create a combined PC and metadata df
+subset.annotation <- cleaned.annotation.df %>% select(sample_ID, combined_sample_name, class_region_segment)
+
+# Set the colors and shapes for the pca plot
+color.mapping <- c("SB-22-2963" = "darkorange", 
+ "SB-18-4726" = "cyan3", 
+ "SB-22-696" = "hotpink", 
+ "SB-22-2794" = "purple", 
+ "TB0118 / 323473" = "yellow3", 
+ "TB0133 / 323477" = "black", 
+ "TB0144 / 338852" = "blue", 
+ "TB0164 / 343961" = "brown")
+
+color.mapping.type <- c("Biopsy_Skin_tumor_LANA_pos" = "orange", 
+ "Biopsy_Skin_vessel_full_ROI" = "blue", 
+ "Biopsy_Skin_tumor_full_ROI" = "magenta", 
+ "PDX_Skin_tumor_LANA_pos" = "brown", 
+ "PDX_Skin_tumor_full_ROI" = "yellow3")
+
+shape.mapping <- c("Biopsy_Skin_tumor_LANA_pos" = 17, 
+ "Biopsy_Skin_vessel_full_ROI" = 16, 
+ "Biopsy_Skin_tumor_full_ROI" = 15, 
+ "PDX_Skin_tumor_LANA_pos" = 11, 
+ "PDX_Skin_tumor_full_ROI" = 23)
+
+pca.annotation.df <- merge(subset.annotation, pca.stats.X1_2, by = "sample_ID")
+
+# Rename columns for the legend
+pca.annotation.df$`Type` <- pca.annotation.df$class_region_segment
+pca.annotation.df$`Name` <- pca.annotation.df$combined_sample_name
+
+# Create the scatter plot
+pca.plot <- ggplot(pca.annotation.df, aes(x = PC1, 
+ y = PC2, 
+ color = Type, 
+ fill = Type)) +
+ geom_point(size = 3, alpha = 0.8) + 
+ scale_color_manual(values = color.mapping.type) + 
+ scale_fill_manual(values = color.mapping.type) + 
+  theme(
+   axis.title = element_text(size = 18),
+   axis.text = element_text(size = 16),
+   legend.title = element_text(size = 16),
+   legend.text = element_text(size = 14)
+ )
+
+
+print(pca.plot)
+
+export <- FALSE
+if(export){
+  
+  ggsave(filename = paste0(params$results.folder, "NIDAP_results/pca/PCA_Supp_Fig6D.png"), 
+         pca.plot, 
+         height = 10,
+         width = 12)
+  
+}
+
+```
+
+### MA Plots
+
+```{r}
+# Set up pre and post normalization counts and convert to log
+
+pre.norm.counts <-
+  log(as.data.frame(q3.normalization.output$object@assayData$exprs), base = 2)
+
+post.q3norm.logcounts <- log(as.data.frame(q3.normalization.output$object@assayData$q_norm), base = 2)
+
+post.negnorm.logcounts <- log(as.data.frame(neg.normalization.output$object@assayData$neg_norm), base = 2)
+
+quantile.normalization.logcounts <- log(quantile.normalization.counts, base = 2)
+
+# Setup annotation groups for the ratio "M" (log A - log B)
+region.types <- c("Biopsy_Skin", "PDX_Skin")
+
+# Define the name of the contrast
+contrast.name <- paste0(region.types[[1]], 
+                        "_", 
+                        region.types[[2]])
+
+# Set up the annotations and raw counts for the MA plots
+contrast.field <- "class"
+condition.label <- "Biopsy_Skin"
+reference.label <- "PDX_Skin"
+raw.log.counts <- pre.norm.counts
+annotation.MA <- annotation
+```
+
+#### Q3 Normalization
+
+```{r MA Plot Q3, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+# MA plots for two annotation groups to evaluate negative normalization
+log.counts <- post.q3norm.logcounts
+
+MA.plots.q3 <- make_MA(contrast.field = contrast.field, 
+                       condition.label = condition.label, 
+                       reference.label = reference.label, 
+                       log.counts = log.counts, 
+                       raw.log.counts = raw.log.counts, 
+                       annotation = annotation.MA)
+  
+  
+grid.draw(MA.plots.q3)
+```
+
+#### Negative Normalization
+
+```{r MA Plot Neg, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+
+# MA plots for two annotation groups to evaluate negative normalization
+log.counts <- post.negnorm.logcounts
+
+MA.plots.neg <- make_MA(contrast.field = contrast.field, 
+                    condition.label = condition.label, 
+                    reference.label = reference.label, 
+                    log.counts = log.counts, 
+                    raw.log.counts = raw.log.counts, 
+                    annotation = annotation.MA)
+  
+  
+grid.draw(MA.plots.neg)
+```
+
+#### Quantile Normalization
+
+```{r MA Plot Quant, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+
+# MA plots for two annotation groups to evaluate negative normalization
+log.counts <- quantile.normalization.logcounts
+
+MA.plots.quant <- make_MA(contrast.field = contrast.field, 
+                    condition.label = condition.label, 
+                    reference.label = reference.label, 
+                    log.counts = log.counts, 
+                    raw.log.counts = raw.log.counts, 
+                    annotation = annotation.MA)
+  
+  
+grid.draw(MA.plots.quant)
+
+
+```
+
+### Genes of Interest Counts
+
+```{r Genes of Interest Counts}
+
+
+CXCR4.counts <- as.data.frame(t((q3.counts["CXCR4",,drop = FALSE])))
+CXCL12.counts <- as.data.frame(t((q3.counts["CXCL12",,drop = FALSE])))
+
+
+# Compare to NIDAP
+NIDAP.all.counts <- read.csv(paste0(params$results.folder, 
+                                      "NIDAP_results/", 
+                                      "GSE290108_CXCR4_updated.csv"))
+
+NIDAP.CXCR4.counts <- NIDAP.all.counts %>% 
+  filter(CXCR4 != "NA")
+
+final.NIDAP.AOIs <- NIDAP.CXCR4.counts$Sample_ID
+
+
+
+# What AOIs are missing in the original set from the NIDAP list 
+diff.NIDAP.AOIs <- setdiff(NIDAP.all.counts$Sample_ID, gsub("\\.dcc", "", rownames(pData(init.object))))
+
+all.annotation <- pData(init.object)
+all.annotation$sample_ID <- gsub(".dcc", "", rownames(all.annotation))
+
+annotation.diff.init_v_NIDAP.AOIs <- all.annotation %>% 
+  filter(sample_ID %in% diff.NIDAP.AOIs)
+
+# What AOIs are missing in the filtered set from the NIDAP list 
+
+diff.NIDAP.AOIs <- setdiff(final.NIDAP.AOIs, gsub("\\.dcc", "", colnames(q3.counts)))
+
+all.annotation <- pData(init.object)
+all.annotation$sample_ID <- gsub(".dcc", "", rownames(all.annotation))
+
+annotation.diff.filter_v_NIDAP.AOIs <- all.annotation %>% 
+  filter(sample_ID %in% diff.NIDAP.AOIs)
+
+
+
+# What are the AOIs missing from the NIDAP list but in the original set
+diff.original.AOIs <- setdiff(gsub("\\.dcc", "", colnames(q3.counts)), final.NIDAP.AOIs)
+
+annotation.original.AOIs <- all.annotation %>% 
+  filter(sample_ID %in% diff.original.AOIs)
+
+# Create the CXCR4 and CXCL12 data frame with annotations
+q3.counts.subset <- q3.counts %>% 
+  filter(gene %in% c("CXCR4", "CXCL12"))
+
+# Format for merging with annotation
+counts.t <- as.data.frame(t(q3.counts.subset))
+counts.t <- counts.t[2:length(counts.t$CXCL12),] # remove first row with gene names
+counts.t$segmentID <- rownames(counts.t)
+
+counts.anno.df <- merge(cleaned.annotation.df, counts.t, by = "segmentID")
+
+counts.anno.df.final <- counts.anno.df %>% 
+  select(sample_ID, 
+         slide_name, 
+         segment, 
+         class, 
+         region, 
+         Tumor, 
+         Source, 
+         LANA_segmented, 
+         roi, 
+         CXCR4, 
+         CXCL12)
+
+export <- FALSE
+if(export){
+  
+  write.csv(counts.anno.df.final, 
+            file = paste0(params$project.folder, 
+                          "NIDAP_Workbook_Restoration/", 
+                          "CXCR4_CXCL12_counts_annotation.csv"),  
+            row.names = FALSE)
+  
+}
+```
